@@ -3,10 +3,8 @@
 Runs pipeline stages in sequence or concurrently (streaming mode).
 
 Usage (via CLI):
-    applypilot run                        # all stages, sequential
-    applypilot run --stream               # all stages, concurrent
-    applypilot run discover enrich        # specific stages
-    applypilot run score tailor cover     # LLM-only stages
+    applypilot run                        # discover jobs
+    applypilot run discover               # same
     applypilot run --dry-run              # preview without executing
 """
 
@@ -32,26 +30,16 @@ console = Console()
 # Stage definitions
 # ---------------------------------------------------------------------------
 
-STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+STAGE_ORDER = ("discover",)
 
 STAGE_META: dict[str, dict] = {
     "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
-    "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
-    "score":    {"desc": "LLM scoring (fit 1-10)"},
-    "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
-    "cover":    {"desc": "Cover letter generation"},
-    "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
 }
 
 # Upstream dependency: a stage only finishes when its upstream is done AND
 # it has no remaining pending work.
 _UPSTREAM: dict[str, str | None] = {
     "discover": None,
-    "enrich":   "discover",
-    "score":    "enrich",
-    "tailor":   "score",
-    "cover":    "tailor",
-    "pdf":      "cover",
 }
 
 
@@ -99,69 +87,9 @@ def _run_discover(workers: int = 1) -> dict:
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
-    """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
-    try:
-        from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("Enrichment failed: %s", e)
-        return {"status": f"error: {e}"}
-
-
-def _run_score() -> dict:
-    """Stage: LLM scoring — assign fit scores 1-10."""
-    try:
-        from applypilot.scoring.scorer import run_scoring
-        run_scoring()
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("Scoring failed: %s", e)
-        return {"status": f"error: {e}"}
-
-
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
-    """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
-    try:
-        from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("Tailoring failed: %s", e)
-        return {"status": f"error: {e}"}
-
-
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
-    """Stage: Cover letter generation."""
-    try:
-        from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("Cover letter generation failed: %s", e)
-        return {"status": f"error: {e}"}
-
-
-def _run_pdf() -> dict:
-    """Stage: PDF conversion — convert tailored resumes and cover letters to PDF."""
-    try:
-        from applypilot.scoring.pdf import batch_convert
-        batch_convert()
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("PDF conversion failed: %s", e)
-        return {"status": f"error: {e}"}
-
-
 # Map stage names to their runner functions
 _STAGE_RUNNERS: dict[str, callable] = {
     "discover": _run_discover,
-    "enrich":   _run_enrich,
-    "score":    _run_score,
-    "tailor":   _run_tailor,
-    "cover":    _run_cover,
-    "pdf":      _run_pdf,
 }
 
 
@@ -219,26 +147,8 @@ class _StageTracker:
             return dict(self._results)
 
 
-# SQL to count pending work for each stage
-_PENDING_SQL: dict[str, str] = {
-    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
-    "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
-    "tailor": (
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
-        "AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL "
-        "AND COALESCE(tailor_attempts, 0) < 5"
-    ),
-    "cover": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
-        "AND COALESCE(cover_attempts, 0) < 5"
-    ),
-    "pdf": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND tailored_resume_path LIKE '%.txt'"
-    ),
-}
+# SQL to count pending work for each stage (discover has no pending poll loop)
+_PENDING_SQL: dict[str, str] = {}
 
 # How long to sleep between polling loops in streaming mode (seconds)
 _STREAM_POLL_INTERVAL = 10
@@ -271,13 +181,10 @@ def _run_stage_streaming(
     """
     runner = _STAGE_RUNNERS[stage]
     kwargs: dict = {}
-    if stage in ("tailor", "cover"):
-        kwargs["min_score"] = min_score
-        kwargs["validation_mode"] = validation_mode
-    if stage in ("discover", "enrich"):
+    if stage == "discover":
         kwargs["workers"] = workers
 
-    upstream = _UPSTREAM[stage]
+    upstream = _UPSTREAM.get(stage)
 
     if stage == "discover":
         # Discover runs once (its sub-scrapers already do their full crawl)
@@ -289,7 +196,7 @@ def _run_stage_streaming(
             tracker.mark_done(stage, {"status": f"error: {e}"})
         return
 
-    # For downstream stages: loop until upstream done + no pending work
+    # For any future downstream stages: loop until upstream done + no pending work
     passes = 0
     while not stop_event.is_set():
         # Wait for upstream to start producing work (first pass only)
@@ -342,10 +249,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
         try:
             kwargs: dict = {}
-            if name in ("tailor", "cover"):
-                kwargs["min_score"] = min_score
-                kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
+            if name == "discover":
                 kwargs["workers"] = workers
             result = runner(**kwargs)
             elapsed = time.time() - t0
@@ -453,10 +357,11 @@ def run_pipeline(
 
     Args:
         stages: List of stage names, or None / ["all"] for full pipeline.
-        min_score: Minimum fit score for tailor/cover stages.
+        min_score: Unused (kept for CLI compatibility).
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
-        workers: Number of parallel threads for discovery/enrichment stages.
+        workers: Number of parallel threads for discovery scrapers.
+        validation_mode: Unused (kept for CLI compatibility).
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -478,14 +383,12 @@ def run_pipeline(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
         border_style="blue",
     ))
-    console.print(f"  Min score:  {min_score}")
     console.print(f"  Workers:    {workers}")
-    console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
     # Pre-run stats
     pre_stats = get_stats()
-    console.print(f"  DB:        {pre_stats['total']} jobs, {pre_stats['pending_detail']} pending enrichment")
+    console.print(f"  DB:        {pre_stats['total']} jobs")
 
     if dry_run:
         console.print(f"\n  [yellow]DRY RUN[/yellow] — would execute ({mode}):")
@@ -529,10 +432,6 @@ def run_pipeline(
     final = get_stats()
     console.print(f"\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
-    console.print(f"    With desc:      {final['with_description']}")
-    console.print(f"    Scored:         {final['scored']}")
-    console.print(f"    Tailored:       {final['tailored']}")
-    console.print(f"    Cover letters:  {final['with_cover_letter']}")
     console.print(f"    Ready to apply: {final['ready_to_apply']}")
     console.print(f"    Applied:        {final['applied']}")
     console.print(f"{'=' * 70}\n")

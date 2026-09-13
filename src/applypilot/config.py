@@ -13,6 +13,7 @@ DB_PATH = APP_DIR / "applypilot.db"
 PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
+TRANSCRIPT_PATH = Path("/Users/Claw/Downloads/University_of_Texas_Academic_Summary.pdf")
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 
@@ -163,11 +164,13 @@ def load_base_urls() -> dict[str, str | None]:
 
 DEFAULTS = {
     "min_score": 7,
-    "max_apply_attempts": 3,
+    "max_apply_attempts": 2,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
+    "capsolver_poll_interval": 2,
+    "capsolver_timeout": 120,
 }
 
 
@@ -186,13 +189,13 @@ def load_env():
 
 TIER_LABELS = {
     1: "Discovery",
-    2: "AI Scoring & Tailoring",
+    2: "Discovery + setup",
     3: "Full Auto-Apply",
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
-    1: ["init", "run discover", "run enrich", "status", "dashboard"],
-    2: ["run score", "run tailor", "run cover", "run pdf", "run"],
+    1: ["init", "run discover", "status", "dashboard"],
+    2: ["init", "run discover", "status", "dashboard"],
     3: ["apply"],
 }
 
@@ -200,27 +203,23 @@ TIER_COMMANDS: dict[int, list[str]] = {
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
-    Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 1 (Discovery):      Python + pip
+    Tier 2 (same as 1):      kept for compatibility
+    Tier 3 (Full Auto-Apply): + Codex CLI + Chrome
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
-    if not has_llm:
-        return 1
-
-    has_claude = shutil.which("claude") is not None
+    has_codex = shutil.which("codex") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_codex and has_chrome:
         return 3
 
-    return 2
+    return 1
 
 
 def check_tier(required: int, feature: str) -> None:
@@ -238,11 +237,9 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if not shutil.which("codex"):
+            missing.append("Codex CLI — install Codex CLI and sign in")
         try:
             get_chrome_path()
         except FileNotFoundError:

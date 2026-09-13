@@ -1,11 +1,12 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn Codex CLI sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + Codex for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import csv
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,10 +27,10 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import chrome, dashboard, codex_prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
+    reset_worker_dir, cleanup_on_exit, cleanup_browser_tabs, _kill_process_tree,
     BASE_CDP_PORT,
 )
 from applypilot.apply.dashboard import (
@@ -49,9 +51,29 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
-_claude_lock = threading.Lock()
+# Track active Codex processes for skip (Ctrl+C) handling
+_codex_procs: dict[int, subprocess.Popen] = {}
+_codex_lock = threading.Lock()
+
+PLAYWRIGHT_MCP_VERSION = "0.0.80"
+EXCLUDED_COMPANIES = ("google", "coinbase")
+PLAYWRIGHT_ENABLED_TOOLS = [
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_snapshot",
+    "browser_take_screenshot",
+    "browser_click",
+    "browser_fill_form",
+    "browser_type",
+    "browser_select_option",
+    "browser_file_upload",
+    "browser_press_key",
+    "browser_wait_for",
+    "browser_tabs",
+    "browser_hover",
+    "browser_drag",
+    "browser_handle_dialog",
+]
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -63,38 +85,75 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
-def _make_mcp_config(cdp_port: int) -> dict:
-    """Build MCP config dict for a specific CDP port."""
+def _make_mcp_config(cdp_port: int, secrets_path: Path | None = None) -> dict:
+    """Build the single, pinned MCP definition used by Codex."""
+    args = [
+        "-y",
+        f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}",
+        f"--cdp-endpoint=http://localhost:{cdp_port}",
+        f"--viewport-size={config.DEFAULTS['viewport']}",
+        "--snapshot-mode=incremental",
+        "--image-responses=omit",
+        "--codegen=none",
+    ]
+    if secrets_path is not None:
+        args.append(f"--secrets={secrets_path}")
     return {
         "mcpServers": {
             "playwright": {
                 "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest",
-                    f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={config.DEFAULTS['viewport']}",
-                ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+                "args": args,
+                "required": True,
+                "enabled_tools": PLAYWRIGHT_ENABLED_TOOLS,
+                "default_tools_approval_mode": "approve",
             },
         }
     }
+
+
+def build_codex_command(model: str, port: int, worker_dir: Path,
+                        final_output_path: Path,
+                        secrets_path: Path | None = None) -> list[str]:
+    """Build a locked-down, non-interactive Codex command."""
+    args = _make_mcp_config(port, secrets_path)["mcpServers"]["playwright"]["args"]
+    args_toml = json.dumps(args)
+    tools_toml = json.dumps(PLAYWRIGHT_ENABLED_TOOLS)
+    return [
+        "codex", "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "--disable", "shell_tool",
+        "--skip-git-repo-check",
+        "--sandbox", "read-only",
+        "--model", model,
+        "-C", str(worker_dir),
+        "-c", 'mcp_servers.playwright.command="npx"',
+        "-c", f"mcp_servers.playwright.args={args_toml}",
+        "-c", "mcp_servers.playwright.required=true",
+        "-c", f"mcp_servers.playwright.enabled_tools={tools_toml}",
+        "-c", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
+        "-c", 'web_search="disabled"',
+        "-c", "tools.view_image=false",
+        "--json",
+        "--output-last-message", str(final_output_path),
+        "-",
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Database operations
 # ---------------------------------------------------------------------------
 
-def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+def acquire_job(target_url: str | None = None, min_score: int = 0,
+                worker_id: int = 0, reserve: bool = True) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
-        target_url: Apply to a specific URL instead of picking from queue.
-        min_score: Minimum fit_score threshold.
+        target_url: Apply to a specific job URL instead of picking from queue.
+        min_score: Unused (scoring removed); kept for CLI compatibility.
         worker_id: Worker claiming this job (for tracking).
+        reserve: Mark the selected job in progress. Dry runs set this to False.
 
     Returns:
         Job dict or None if the queue is empty.
@@ -110,14 +169,21 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
+                  AND LOWER(TRIM(site)) NOT IN ('google', 'coinbase')
+                  AND LOWER(url) NOT LIKE '%master%'
+                  AND LOWER(url) NOT LIKE '%mba%'
+                  AND LOWER(url) NOT LIKE '%phd%'
+                  AND LOWER(url) NOT LIKE '%ph.d%'
+                  AND LOWER(url) NOT LIKE '%doctoral%'
+                  AND LOWER(url) NOT LIKE '%doctorate%'
+                  AND LOWER(url) NOT LIKE '%graduate-student%'
+                  AND LOWER(url) NOT LIKE '%graduate-intern%'
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
+            params: list = [config.DEFAULTS["max_apply_attempts"]]
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -131,15 +197,36 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
+                WHERE (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                  AND LOWER(TRIM(site)) NOT IN ('google', 'coinbase')
+                  AND LOWER(title) NOT LIKE '%master%'
+                  AND LOWER(title) NOT LIKE '%mba%'
+                  AND LOWER(title) NOT LIKE '%phd%'
+                  AND LOWER(title) NOT LIKE '%ph.d%'
+                  AND LOWER(title) NOT LIKE '%doctoral%'
+                  AND LOWER(title) NOT LIKE '%doctorate%'
+                  AND LOWER(title) NOT LIKE '%graduate student%'
+                  AND LOWER(title) NOT LIKE '%graduate intern%'
+                  AND LOWER(url) NOT LIKE '%master%'
+                  AND LOWER(url) NOT LIKE '%mba%'
+                  AND LOWER(url) NOT LIKE '%phd%'
+                  AND LOWER(url) NOT LIKE '%ph.d%'
+                  AND LOWER(url) NOT LIKE '%doctoral%'
+                  AND LOWER(url) NOT LIKE '%doctorate%'
+                  AND LOWER(url) NOT LIKE '%graduate-student%'
+                  AND LOWER(url) NOT LIKE '%graduate-intern%'
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY
+                  CASE
+                    WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 0
+                    WHEN COALESCE(application_url, url) LIKE '%workday%' THEN 1
+                    ELSE 2
+                  END,
+                  url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, params).fetchone()
 
         if not row:
             conn.rollback()
@@ -157,16 +244,29 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
+        job = dict(row)
+        if not reserve:
+            conn.rollback()
+            # Always use the master resume — enrich/score/tailor stages are removed.
+            job["tailored_resume_path"] = str(config.RESUME_PATH)
+            return job
+
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
                            agent_id = ?,
-                           last_attempted_at = ?
+                           last_attempted_at = ?,
+                           apply_error = NULL
             WHERE url = ?
         """, (f"worker-{worker_id}", now, row["url"]))
         conn.commit()
+        # Remove a previous failed export while this attempt is active.  The
+        # CSV is an issues/results export, so it must not retain stale rows.
+        _sync_applications_csv(conn)
 
-        return dict(row)
+        # Always use the master resume — enrich/score/tailor stages are removed.
+        job["tailored_resume_path"] = str(config.RESUME_PATH)
+        return job
     except Exception:
         conn.rollback()
         raise
@@ -176,6 +276,8 @@ def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
+    from applypilot.hermes_learning import record_outcome
+
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
@@ -194,6 +296,61 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
+    _sync_applications_csv(conn)
+    job = conn.execute(
+        "SELECT site, title, application_url, url FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if job:
+        try:
+            record_outcome(
+                job=dict(job),
+                status=status,
+                error=error,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            # Learning is advisory and must never affect queue progress.
+            pass
+
+
+def _sync_applications_csv(conn=None) -> None:
+    """Keep both application CSV exports current, including issue rows."""
+    close_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT applied_at, site, title, application_url, url,
+                   apply_status, apply_error
+            FROM jobs
+            WHERE apply_status IN ('applied', 'failed')
+            ORDER BY COALESCE(applied_at, ''), site, title
+        """).fetchall()
+        headers = [
+            "applied_at", "site", "title", "application_url", "url",
+            "apply_status", "apply_error",
+        ]
+        destinations = [
+            config.APP_DIR / "applications.csv",
+            Path(__file__).resolve().parents[3] / "applications.csv",
+        ]
+        for destination in destinations:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Replace atomically so readers never observe a truncated export
+            # while the live worker is syncing results.
+            with tempfile.NamedTemporaryFile(
+                mode="w", newline="", encoding="utf-8",
+                dir=destination.parent, prefix=f".{destination.name}.tmp-",
+                delete=False,
+            ) as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                writer.writerows(rows)
+                temporary = Path(handle.name)
+            os.replace(temporary, destination)
+    finally:
+        if close_conn:
+            conn.close()
 
 
 def release_lock(url: str) -> None:
@@ -206,13 +363,52 @@ def release_lock(url: str) -> None:
     conn.commit()
 
 
+def _send_notification(message: str) -> None:
+    """Retained for compatibility; external notifications are disabled."""
+    del message
+
+
+def _wait_for_captcha_resolution(job: dict, worker_id: int) -> bool:
+    """Pause a worker until the user marks its visible CAPTCHA as solved."""
+    marker = config.APP_DIR / f"captcha-worker-{worker_id}.resolved"
+    _send_notification(
+        f"CAPTCHA needs you: {job.get('title', 'job')} at {job.get('site', 'employer')}. "
+        "Solve it in the open Chrome window, then reply 'done' in Codex."
+    )
+    add_event(f"[W{worker_id}] CAPTCHA waiting for user; browser left open")
+    update_state(worker_id, status="captcha", last_action="waiting for user")
+    while not _stop_event.wait(timeout=2):
+        if marker.exists():
+            marker.unlink(missing_ok=True)
+            add_event(f"[W{worker_id}] CAPTCHA marked solved; resuming")
+            return True
+    return False
+
+
+def _resolve_captcha(job: dict, worker_id: int, port: int) -> bool:
+    """Try CapSolver first, then fall back to the manual marker wait."""
+    from applypilot.apply.capsolver import is_enabled, try_solve_on_cdp
+
+    if is_enabled():
+        update_state(worker_id, status="captcha", last_action="CapSolver solving")
+        add_event(f"[W{worker_id}] CapSolver attempting to solve CAPTCHA")
+        try:
+            if try_solve_on_cdp(port):
+                add_event(f"[W{worker_id}] CapSolver solved CAPTCHA")
+                return True
+        except Exception:
+            logger.exception("CapSolver auto-solve failed")
+        add_event(f"[W{worker_id}] CapSolver could not auto-solve; waiting for user")
+    return _wait_for_captcha_resolution(job, worker_id)
+
+
 # ---------------------------------------------------------------------------
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+               model: str = "gpt-5.6-luna", worker_id: int = 0) -> Path | None:
+    """Generate a prompt file for manual Codex debugging.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -295,14 +491,26 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str = "gpt-5.6-luna", dry_run: bool = False,
+            resume_current_page: bool = False) -> tuple[str, int]:
+    """Spawn a Codex CLI session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    worker_dir = reset_worker_dir(worker_id)
+
+    profile = config.load_profile()
+    secrets_path = worker_dir / ".secrets.env"
+    secrets_path.write_text(
+        "APPLYPILOT_EMAIL=" + profile["personal"]["email"] + "\n"
+        "APPLYPILOT_PASSWORD=" + profile["personal"].get("password", "") + "\n",
+        encoding="utf-8",
+    )
+    secrets_path.chmod(0o600)
+
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -310,44 +518,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    from applypilot.apply.capsolver import is_enabled as capsolver_enabled
+
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        upload_dir=worker_dir,
+        resume_current_page=resume_current_page,
+        capsolver_enabled=capsolver_enabled(),
     )
 
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
-
     env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    worker_dir = reset_worker_dir(worker_id)
+    final_output_path = config.LOG_DIR / f"codex-final-{worker_id}.txt"
+    final_output_path.unlink(missing_ok=True)
+    cmd = build_codex_command(model, port, worker_dir, final_output_path, secrets_path)
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
@@ -380,8 +566,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
-        with _claude_lock:
-            _claude_procs[worker_id] = proc
+        with _codex_lock:
+            _codex_procs[worker_id] = proc
 
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
@@ -396,47 +582,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     continue
                 try:
                     msg = json.loads(line)
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
-
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
-                        stats = {
-                            "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
-                            "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
-                        }
-                        text_parts.append(msg.get("result", ""))
+                    msg_type = msg.get("type", "event")
+                    lf.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    if msg_type == "item.completed":
+                        item = msg.get("item", {})
+                        if item.get("type") == "agent_message":
+                            text_parts.append(item.get("text", ""))
+                        elif item.get("type") in {"mcp_tool_call", "command_execution"}:
+                            ws = get_state(worker_id)
+                            cur_actions = ws.actions if ws else 0
+                            desc = item.get("name") or item.get("command") or msg_type
+                            update_state(worker_id, actions=cur_actions + 1,
+                                         last_action=str(desc)[:35])
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
@@ -448,12 +605,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if returncode and returncode < 0:
             return "skipped", int((time.time() - start) * 1000)
 
+        if final_output_path.exists():
+            text_parts.append(final_output_path.read_text(encoding="utf-8"))
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"codex_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
@@ -509,8 +668,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
-        with _claude_lock:
-            _claude_procs.pop(worker_id, None)
+        with _codex_lock:
+            _codex_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
 
@@ -522,13 +681,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
     "not_eligible_location", "not_eligible_salary",
+    "job_requires_PhD", "job_requires_masters", "job_requires_MBA",
+    "job_requires_doctorate", "job_requires_grad_school",
+    "manual_question",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "workday_unavailable", "workday_maintenance", "site_unavailable",
+    "captcha_token_not_accepted",
+    "hcaptcha_blocked",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by", "manual_question", "hcaptcha", "cookie_banner")
 
 
 def _is_permanent_failure(result: str) -> bool:
@@ -548,7 +713,7 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "gpt-5.6-luna", dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -557,7 +722,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Codex model name.
         dry_run: Don't click Submit.
 
     Returns:
@@ -578,7 +743,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, reserve=not dry_run)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -603,6 +768,32 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
+
+            captcha_rounds = 0
+            while result == "captcha" and not dry_run:
+                if captcha_rounds >= 2:
+                    add_event(f"[W{worker_id}] CAPTCHA loop limit; marking failed")
+                    result = "failed:captcha"
+                    break
+                if not _resolve_captcha(job, worker_id, port):
+                    result = "skipped"
+                    break
+                captcha_rounds += 1
+                resumed_result, resumed_ms = run_job(
+                    job, port=port, worker_id=worker_id,
+                    model=model, dry_run=False, resume_current_page=True,
+                )
+                result = resumed_result
+                duration_ms += resumed_ms
+
+            if dry_run:
+                add_event(
+                    f"[W{worker_id}] Dry run finished: {job['title'][:40]}"
+                )
+                jobs_done += 1
+                if target_url:
+                    break
+                continue
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -636,6 +827,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             update_state(worker_id, jobs_failed=failed)
         finally:
             if chrome_proc:
+                cleanup_browser_tabs(port)
                 cleanup_worker(worker_id, chrome_proc)
 
         jobs_done += 1
@@ -651,7 +843,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = False, model: str = "gpt-5.6-luna",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.
@@ -661,7 +853,7 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Codex model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
@@ -697,16 +889,16 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            # Kill all active Codex processes to skip current jobs
+            with _codex_lock:
+                for wid, cproc in list(_codex_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            with _codex_lock:
+                for wid, cproc in list(_codex_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
             kill_all_chrome()

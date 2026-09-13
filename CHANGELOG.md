@@ -5,6 +5,20 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- **Enrich, score, tailor, cover, and PDF pipeline stages** — `applypilot run`
+  is discovery-only. Auto-apply uses the master resume in `~/.applypilot/`
+  with no fit-score or tailored-resume gate.
+
+### Added
+- **CapSolver auto-apply support** — `CAPSOLVER_API_KEY` now loads the official
+  CapSolver Chrome extension into apply workers, calls createTask/getTaskResult
+  when a CAPTCHA still blocks submission, and falls back to the existing manual
+  marker wait. `applypilot init` can save the key without overwriting other
+  `.env` values, and `applypilot doctor` reports the account balance.
+
 ## [0.2.0] - 2026-02-17
 
 ### Added

@@ -6,6 +6,7 @@ worker profile setup/cloning, and cross-platform process cleanup.
 
 import json
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -18,7 +19,8 @@ from applypilot import config
 logger = logging.getLogger(__name__)
 
 # CDP port base — each worker uses BASE_CDP_PORT + worker_id
-BASE_CDP_PORT = 9222
+# Keep ApplyPilot isolated from the user's ticket watcher, which owns 9222.
+BASE_CDP_PORT = 9322
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
@@ -211,6 +213,20 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     chrome_exe = config.get_chrome_path()
 
+    disable_features = [
+        "InfiniteSessionRestore",
+        "PasswordManagerOnboarding",
+    ]
+    extension_dir = None
+    # CapSolver's Chrome extension can inject overlays that make Workday
+    # controls appear "unstable" to Playwright clicks. Prefer the API/CDP
+    # path unless CAPSOLVER_EXTENSION=1 is set explicitly.
+    if not headless and os.environ.get("CAPSOLVER_EXTENSION", "").strip() in {"1", "true", "yes"}:
+        from applypilot.apply.capsolver import prepare_extension
+        extension_dir = prepare_extension()
+        if extension_dir is not None:
+            disable_features.append("DisableLoadExtensionCommandLineSwitch")
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
@@ -220,7 +236,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--no-default-browser-check",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+        f"--disable-features={','.join(disable_features)}",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
         "--password-store=basic",
@@ -232,13 +248,20 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if extension_dir is None:
+        # Profile may still contain unpacked/marketplace extensions from prior
+        # runs; force them off so overlays cannot block ATS clicks.
+        cmd.append("--disable-extensions")
+    if extension_dir is not None:
+        from applypilot.apply.capsolver import extension_chrome_args
+        cmd.extend(extension_chrome_args(extension_dir))
+        logger.info("[worker-%d] CapSolver extension loaded", worker_id)
     if headless:
         cmd.append("--headless=new")
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if platform.system() != "Windows":
-        import os
         kwargs["preexec_fn"] = os.setsid
 
     proc = subprocess.Popen(cmd, **kwargs)
@@ -264,6 +287,32 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
+
+
+def cleanup_browser_tabs(port: int, keep_pages: int = 1) -> None:
+    """Close extra tabs in a worker browser without closing Chrome itself.
+
+    Codex is instructed to close tabs, but ATS flows can leave redirects and
+    account pages behind.  A post-job sweep keeps the isolated worker profile
+    bounded while preserving the current application page until the caller
+    records the result and tears down Chrome.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=3000
+            )
+            pages = [page for context in browser.contexts for page in context.pages]
+            for page in pages[keep_pages:]:
+                try:
+                    page.close(run_before_unload=False)
+                except Exception:
+                    logger.debug("Could not close extra worker tab", exc_info=True)
+    except Exception:
+        # Tab cleanup is defensive and must not change the application result.
+        logger.debug("Worker tab cleanup unavailable on port %d", port, exc_info=True)
 
 
 def kill_all_chrome() -> None:

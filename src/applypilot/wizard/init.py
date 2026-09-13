@@ -10,6 +10,7 @@ Interactive flow that creates ~/.applypilot/ with:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -26,9 +27,36 @@ from applypilot.config import (
     RESUME_PDF_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+    load_env,
 )
 
 console = Console()
+
+
+def _upsert_env(updates: dict[str, str]) -> None:
+    """Merge key=value pairs into ~/.applypilot/.env without dropping existing keys."""
+    existing: dict[str, str] = {}
+    header_lines: list[str] = []
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                header_lines.append(line)
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                existing[key.strip()] = value
+    existing.update(updates)
+    lines = header_lines or ["# ApplyPilot configuration"]
+    if lines[-1].strip():
+        lines.append("")
+    for key, value in existing.items():
+        lines.append(f"{key}={value}")
+    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ENV_PATH.chmod(0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +108,7 @@ def _setup_resume() -> None:
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers auto-fill on applications."))
 
     profile: dict = {}
 
@@ -149,7 +177,7 @@ def _setup_profile() -> dict:
 
     # -- Resume Facts (preserved truths for tailoring) --
     console.print("\n[bold cyan]Resume Facts[/bold cyan]")
-    console.print("[dim]These are preserved exactly during resume tailoring — the AI will never change them.[/dim]")
+    console.print("[dim]Facts preserved exactly when answering application questions — the agent will never invent them.[/dim]")
     companies = Prompt.ask("Companies to always keep (comma-separated)", default="")
     projects = Prompt.ask("Projects to always keep (comma-separated)", default="")
     school = Prompt.ask("School name(s) to preserve", default="")
@@ -234,15 +262,15 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Optional LLM configuration (unused by the simplified discover→apply path)."""
     console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
+        "[bold]Step 4: LLM (optional)[/bold]\n"
+        "An LLM is no longer required for discover or apply.\n"
+        "You can still save a key here for other tooling."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
-        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
+    if not Confirm.ask("Configure an LLM API key anyway?", default=False):
+        console.print("[dim]Skipped. Discover + apply do not need an LLM.[/dim]")
         return
 
     console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
@@ -252,26 +280,25 @@ def _setup_ai_features() -> None:
         default="gemini",
     )
 
-    env_lines = ["# ApplyPilot configuration", ""]
+    updates: dict[str, str] = {}
 
     if provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
         model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
+        updates["GEMINI_API_KEY"] = api_key
+        updates["LLM_MODEL"] = model
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key")
         model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
+        updates["OPENAI_API_KEY"] = api_key
+        updates["LLM_MODEL"] = model
     elif provider == "local":
         url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
         model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
+        updates["LLM_URL"] = url
+        updates["LLM_MODEL"] = model
 
-    env_lines.append("")
-    ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
+    _upsert_env(updates)
     console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
@@ -280,44 +307,48 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires Codex CLI)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
-        console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
+        console.print("[dim]You can apply manually using your resume and profile.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
-        console.print("[green]Claude Code CLI detected.[/green]")
+    # Check for Codex CLI
+    if shutil.which("codex"):
+        console.print("[green]Codex CLI detected.[/green]")
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]Codex CLI not found on PATH.[/yellow]\n"
+            "Install Codex CLI and sign in before using auto-apply."
         )
+    load_env()
+    existing = (os.environ.get("CAPSOLVER_API_KEY") or "").strip()
+    if existing:
+        console.print("[green]CapSolver API key already set.[/green]")
+        if not Confirm.ask("Replace CapSolver API key?", default=False):
+            console.print("[dim]Keeping the existing CapSolver key. CAPTCHAs will be solved automatically during apply.[/dim]")
+            return
 
-    # Optional: CapSolver for CAPTCHAs
-    console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
-    if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
-        # Append to existing .env or create
-        if ENV_PATH.exists():
-            existing = ENV_PATH.read_text(encoding="utf-8")
-            if "CAPSOLVER_API_KEY" not in existing:
-                ENV_PATH.write_text(
-                    existing.rstrip() + f"\nCAPSOLVER_API_KEY={capsolver_key}\n",
-                    encoding="utf-8",
-                )
-        else:
-            ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
-        console.print("[green]CapSolver key saved.[/green]")
+    if Confirm.ask("Add a CapSolver API key to solve CAPTCHAs automatically?", default=True):
+        api_key = Prompt.ask("CapSolver API key (from the capsolver.com dashboard)", password=True).strip()
+        if not api_key:
+            console.print("[dim]No key entered. CAPTCHAs will be left for manual review.[/dim]")
+            return
+        _upsert_env({"CAPSOLVER_API_KEY": api_key})
+        os.environ["CAPSOLVER_API_KEY"] = api_key
+        try:
+            from applypilot.apply.capsolver import get_balance
+            balance = get_balance()
+            console.print(f"[green]CapSolver API key saved.[/green] Balance: ${balance:.2f}")
+        except Exception as exc:
+            console.print(f"[green]CapSolver API key saved.[/green] [yellow]Could not verify balance: {exc}[/yellow]")
     else:
-        console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")
+        console.print("[dim]CAPTCHAs will be left for manual review.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +387,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (Codex detection)
     _setup_auto_apply()
     console.print()
 
@@ -377,10 +408,8 @@ def run_wizard() -> None:
             tier_lines.append(f"  [dim]✗ Tier {t} — {label}  ({cmds})[/dim]")
 
     unlock_hint = ""
-    if tier == 1:
-        unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
-    elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+    if tier < 3:
+        unlock_hint = "\n[dim]To unlock Tier 3: install Codex CLI + Chrome.[/dim]"
 
     console.print(
         Panel.fit(

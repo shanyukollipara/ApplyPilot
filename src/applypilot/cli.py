@@ -26,7 +26,7 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_STAGES = ("discover",)
 
 
 # ---------------------------------------------------------------------------
@@ -83,22 +83,17 @@ def run(
             "Defaults to 'all' if omitted."
         ),
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    min_score: int = typer.Option(0, "--min-score", help="Unused (scoring removed)."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery scrapers."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
     validation: str = typer.Option(
         "normal",
         "--validation",
-        help=(
-            "Validation strictness for tailor/cover stages. "
-            "strict: banned words = errors, judge must pass. "
-            "normal: banned words = warnings only (default, recommended for Gemini free tier). "
-            "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
-        ),
+        help="Unused (tailoring/cover letter stages removed).",
     ),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    """Run pipeline stages (discover jobs)."""
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -113,21 +108,6 @@ def run(
                 f"Valid stages: {', '.join(VALID_STAGES)}, all"
             )
             raise typer.Exit(code=1)
-
-    # Gate AI stages behind Tier 2
-    llm_stages = {"score", "tailor", "cover"}
-    if any(s in stage_list for s in llm_stages) or "all" in stage_list:
-        from applypilot.config import check_tier
-        check_tier(2, "AI scoring/tailoring")
-
-    # Validate the --validation flag value
-    valid_modes = ("strict", "normal", "lenient")
-    if validation not in valid_modes:
-        console.print(
-            f"[red]Invalid --validation value:[/red] '{validation}'. "
-            f"Choose from: {', '.join(valid_modes)}"
-        )
-        raise typer.Exit(code=1)
 
     result = run_pipeline(
         stages=stage_list,
@@ -146,8 +126,8 @@ def run(
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    min_score: int = typer.Option(0, "--min-score", help="Unused (scoring removed)."),
+    model: str = typer.Option("gpt-5.6-luna", "--model", "-m", help="Codex model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -164,7 +144,7 @@ def apply(
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    # --- Utility modes (no Chrome/Codex needed) ---
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
@@ -186,7 +166,7 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (Codex CLI + Chrome)
     check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
@@ -197,16 +177,16 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: Jobs exist (skip for --gen with --url)
     if not (gen and url):
         conn = get_connection()
         ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+            "SELECT COUNT(*) FROM jobs WHERE applied_at IS NULL"
         ).fetchone()[0]
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+                "[red]No jobs ready.[/red]\n"
+                "Run [bold]applypilot run discover[/bold] first."
             )
             raise typer.Exit(code=1)
 
@@ -220,13 +200,11 @@ def apply(
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually (the normal apply command configures Playwright automatically):[/bold]")
         console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
+            f"  codex exec --ignore-user-config --ignore-rules --ephemeral "
+            f"--sandbox read-only --model {model} - < {prompt_file}"
         )
         return
 
@@ -273,40 +251,11 @@ def status() -> None:
     summary.add_column("Count", justify="right")
 
     summary.add_row("Total jobs discovered", str(stats["total"]))
-    summary.add_row("With full description", str(stats["with_description"]))
-    summary.add_row("Pending enrichment", str(stats["pending_detail"]))
-    summary.add_row("Enrichment errors", str(stats["detail_errors"]))
-    summary.add_row("Scored by LLM", str(stats["scored"]))
-    summary.add_row("Pending scoring", str(stats["unscored"]))
-    summary.add_row("Tailored resumes", str(stats["tailored"]))
-    summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
-    summary.add_row("Cover letters", str(stats["with_cover_letter"]))
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
 
     console.print(summary)
-
-    # Score distribution
-    if stats["score_distribution"]:
-        dist_table = Table(title="\nScore Distribution", show_header=True, header_style="bold yellow")
-        dist_table.add_column("Score", justify="center")
-        dist_table.add_column("Count", justify="right")
-        dist_table.add_column("Bar")
-
-        max_count = max(count for _, count in stats["score_distribution"]) or 1
-        for score, count in stats["score_distribution"]:
-            bar_len = int(count / max_count * 30)
-            if score >= 7:
-                color = "green"
-            elif score >= 5:
-                color = "yellow"
-            else:
-                color = "red"
-            bar = f"[{color}]{'=' * bar_len}[/{color}]"
-            dist_table.add_row(str(score), str(count), bar)
-
-        console.print(dist_table)
 
     # By site
     if stats["by_site"]:
@@ -396,13 +345,13 @@ def doctor() -> None:
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
+    # Codex CLI
+    codex_bin = shutil.which("codex")
+    if codex_bin:
+        results.append(("Codex CLI", ok_mark, codex_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Codex CLI", fail_mark,
+                        "Install Codex CLI (needed for auto-apply)"))
 
     # Chrome
     try:
@@ -420,13 +369,18 @@ def doctor() -> None:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
-    # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
-    if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
+    # CapSolver (optional CAPTCHA solving)
+    capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "").strip()
+    if capsolver_key:
+        try:
+            from applypilot.apply.capsolver import get_balance
+            balance = get_balance()
+            results.append(("CapSolver API key", ok_mark, f"balance ${balance:.2f}"))
+        except Exception as exc:
+            results.append(("CapSolver API key", warn_mark, f"set, but unverified ({exc})"))
     else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+        results.append(("CapSolver API key", warn_mark,
+                        "Optional — set CAPSOLVER_API_KEY in ~/.applypilot/.env to auto-solve CAPTCHAs"))
 
     # --- Render results ---
     console.print()
@@ -445,10 +399,7 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
-    elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Codex CLI + Chrome + Node.js)[/dim]")
 
     console.print()
 
