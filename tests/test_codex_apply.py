@@ -184,6 +184,24 @@ def test_assign_worker_batches_persists_even_partition(tmp_path, monkeypatch):
     assert launcher.assign_worker_batches(3) == 0
 
 
+def test_assign_worker_batches_preserves_completed_jobs(tmp_path, monkeypatch):
+    conn = init_db(tmp_path / "batch-completed.db")
+    _insert_job(conn, company="Allowed Co", url="https://allowed.example/done")
+    _insert_job(conn, company="Allowed Co", url="https://allowed.example/pending")
+    conn.execute(
+        "UPDATE jobs SET apply_status = 'applied', apply_worker = 1 WHERE url = ?",
+        ("https://allowed.example/done",),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    assert launcher.assign_worker_batches(10) == 1
+    assert conn.execute(
+        "SELECT apply_worker FROM jobs WHERE url = ?",
+        ("https://allowed.example/done",),
+    ).fetchone()[0] == 1
+
+
 def test_worker_loop_dry_run_does_not_record_result(monkeypatch):
     job = {"url": "https://allowed.example/dry-run", "title": "Dry run job"}
     results = iter([job])

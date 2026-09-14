@@ -23,7 +23,7 @@ print -r -- "$$" > "$PIDFILE"
 trap 'rm -f "$PIDFILE" "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
 
 while true; do
-  "$PYTHON" -m applypilot apply --continuous --workers 5 --headless --model gpt-5.6-luna >> "$LOG" 2>&1
+  "$PYTHON" -m applypilot apply --continuous --workers 10 --headless --model gpt-5.6-luna >> "$LOG" 2>&1
   "$PYTHON" - <<'PY'
 import sqlite3
 from applypilot import config
