@@ -11,6 +11,7 @@ LAUNCHD_LABEL="com.applypilot.supervisor"
 HERMES="/Users/Claw/.local/bin/hermes"
 HERMES_LOCK="/tmp/applypilot-hermes-qc.lock"
 HERMES_LOG="/tmp/applypilot-hermes-qc.log"
+STALE_SECONDS=900
 
 cd "$ROOT"
 
@@ -36,8 +37,19 @@ PY
 
 start_supervisor() {
   # Never allow a dead supervisor and orphan worker to become a second queue.
-  worker_pids=$(pgrep -f "$WORKER_PATTERN" | awk -v self="$$" '$1 != self' || true)
-  [[ -z "$worker_pids" ]] || kill $worker_pids 2>/dev/null || true
+  worker_pids=(${(f)"$(pgrep -f "$WORKER_PATTERN" | awk -v self="$$" '$1 != self' || true)"})
+  if (( ${#worker_pids[@]} )); then
+    kill -TERM "${worker_pids[@]}" 2>/dev/null || true
+    for _ in {1..10}; do
+      remaining=()
+      for worker_pid in "${worker_pids[@]}"; do
+        kill -0 "$worker_pid" 2>/dev/null && remaining+=("$worker_pid")
+      done
+      (( ${#remaining[@]} == 0 )) && break
+      sleep 1
+    done
+    (( ${#remaining[@]} == 0 )) || kill -KILL "${remaining[@]}" 2>/dev/null || true
+  fi
   reset_orphans
   if launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
     if launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
@@ -71,6 +83,37 @@ run_hermes_qc() {
   fi
 }
 
+fleet_health() {
+  "$PYTHON" - <<PY
+import sqlite3
+from datetime import datetime, timezone, timedelta
+from applypilot import config
+
+conn = sqlite3.connect(config.DB_PATH)
+cutoff = (datetime.now(timezone.utc) - timedelta(seconds=$STALE_SECONDS)).isoformat()
+stale = conn.execute(
+    "SELECT COUNT(*) FROM jobs WHERE apply_status='in_progress' AND last_attempted_at < ?",
+    (cutoff,),
+).fetchone()[0]
+missing = []
+for worker in range(10):
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_worker=? AND apply_status IS NULL",
+        (worker,),
+    ).fetchone()[0]
+    active = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_worker=? AND apply_status='in_progress'",
+        (worker,),
+    ).fetchone()[0]
+    if pending and not active:
+        missing.append(str(worker))
+conn.close()
+print(stale, ",".join(missing) or "-")
+PY
+}
+
+missing_checks=0
+last_qc=0
 while true; do
   pid=""
   [[ -f "$PIDFILE" ]] && pid=$(cat "$PIDFILE" 2>/dev/null || true)
@@ -79,9 +122,30 @@ while true; do
     start_supervisor
     print -r -- "$(date -Iseconds) restarted supervisor" >> "$LOG"
   else
-    print -r -- "$(date -Iseconds) healthy supervisor=$pid" >> "$LOG"
+    health=$(fleet_health)
+    stale_count=${health%% *}
+    missing_workers=${health#* }
+    if (( stale_count > 0 )); then
+      print -r -- "$(date -Iseconds) stale workers=$stale_count; restarting" >> "$LOG"
+      start_supervisor
+      missing_checks=0
+    elif [[ "$missing_workers" != "-" ]]; then
+      (( missing_checks += 1 ))
+      print -r -- "$(date -Iseconds) missing workers=$missing_workers check=$missing_checks" >> "$LOG"
+      if (( missing_checks >= 3 )); then
+        start_supervisor
+        missing_checks=0
+      fi
+    else
+      missing_checks=0
+      print -r -- "$(date -Iseconds) healthy supervisor=$pid workers=10" >> "$LOG"
+    fi
   fi
 
-  run_hermes_qc
-  sleep 1800
+  now=$(date +%s)
+  if (( now - last_qc >= 1800 )); then
+    run_hermes_qc
+    last_qc=$now
+  fi
+  sleep 60
 done

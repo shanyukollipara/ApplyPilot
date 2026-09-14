@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -147,7 +148,7 @@ def test_acquire_job_removes_stale_failed_csv_row(tmp_path, monkeypatch):
     assert sync_calls == [conn]
 
 
-def test_acquire_job_finishes_pending_queue_before_retrying_failures(tmp_path, monkeypatch):
+def test_acquire_job_immediately_retries_failure_before_next_pending_job(tmp_path, monkeypatch):
     conn = init_db(tmp_path / "pending-before-retry.db")
     failed_url = "https://allowed.example/a-failed"
     pending_url = "https://allowed.example/z-pending"
@@ -163,7 +164,7 @@ def test_acquire_job_finishes_pending_queue_before_retrying_failures(tmp_path, m
     monkeypatch.setattr(launcher.config, "is_manual_ats", lambda _: False)
     monkeypatch.setattr(launcher, "_sync_applications_csv", lambda _: None)
 
-    assert launcher.acquire_job(min_score=0)["url"] == pending_url
+    assert launcher.acquire_job(min_score=0)["url"] == failed_url
 
 
 def test_assign_worker_batches_persists_even_partition(tmp_path, monkeypatch):
@@ -182,6 +183,12 @@ def test_assign_worker_batches_persists_even_partition(tmp_path, monkeypatch):
     ).fetchall()
     assert [tuple(row) for row in counts] == [(0, 3), (1, 2), (2, 2)]
     assert launcher.assign_worker_batches(3) == 0
+    _insert_job(conn, company="Allowed Co", url="https://allowed.example/job-7")
+    assert launcher.assign_worker_batches(3) == 1
+    assert conn.execute(
+        "SELECT apply_worker FROM jobs WHERE url = ?",
+        ("https://allowed.example/job-7",),
+    ).fetchone()[0] == 1
 
 
 def test_assign_worker_batches_preserves_completed_jobs(tmp_path, monkeypatch):
@@ -217,6 +224,75 @@ def test_worker_loop_dry_run_does_not_record_result(monkeypatch):
 
     assert launcher.worker_loop(limit=1, dry_run=True) == (0, 0)
     assert marked == []
+
+
+def test_headless_worker_records_unsolved_captcha_instead_of_hanging(monkeypatch):
+    job = {
+        "url": "https://allowed.example/captcha",
+        "title": "Captcha job",
+        "site": "Allowed Co",
+    }
+    results = iter([job])
+    marked = []
+    monkeypatch.setattr(launcher, "acquire_job", lambda **_: next(results, None))
+    monkeypatch.setattr(launcher, "launch_chrome", lambda *args, **kwargs: object())
+    monkeypatch.setattr(launcher, "run_job", lambda *args, **kwargs: ("captcha", 1))
+    monkeypatch.setattr(launcher, "_resolve_captcha", lambda *args, **kwargs: False)
+    monkeypatch.setattr(launcher, "cleanup_browser_tabs", lambda *args: None)
+    monkeypatch.setattr(launcher, "cleanup_worker", lambda *args: None)
+    monkeypatch.setattr(launcher, "mark_result", lambda *args, **kwargs: marked.append((args, kwargs)))
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+
+    assert launcher.worker_loop(limit=1, headless=True) == (0, 1)
+    assert marked[0][0][:3] == (
+        job["url"], "failed", "captcha_unsolved",
+    )
+    assert marked[0][1]["permanent"] is False
+
+
+def test_run_job_enforces_wall_clock_timeout(tmp_path, monkeypatch):
+    class HangingProcess:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, input, timeout):
+            assert input == "prompt"
+            assert timeout == launcher.config.DEFAULTS["apply_timeout"]
+            raise subprocess.TimeoutExpired("codex", timeout)
+
+        def poll(self):
+            return None
+
+    killed = []
+    popen_options = {}
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda _: tmp_path)
+    monkeypatch.setattr(
+        launcher.config,
+        "load_profile",
+        lambda: {"personal": {"email": "x@example.com", "password": "pw"}},
+    )
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **_: "prompt")
+    monkeypatch.setattr("applypilot.apply.capsolver.is_enabled", lambda: False)
+    monkeypatch.setattr(launcher, "build_codex_command", lambda *args, **kwargs: ["codex"])
+    def fake_popen(*args, **kwargs):
+        popen_options.update(kwargs)
+        return HangingProcess()
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+
+    result, _ = launcher.run_job(
+        {"url": "https://example.test", "title": "Intern", "site": "Example"},
+        port=9322,
+    )
+
+    assert result == "failed:timeout"
+    assert killed == [12345]
+    assert popen_options["start_new_session"] is True
 
 
 def test_playwright_mcp_is_pinned_and_is_the_only_mcp(tmp_path):
@@ -258,6 +334,7 @@ def test_codex_command_is_ephemeral_read_only_and_ignores_user_config(tmp_path):
     assert "tools.view_image=false" in rendered
     assert "--secrets=" in rendered
     assert "mcp_servers.playwright" in rendered
+    assert "mcp_servers.playwright.startup_timeout_sec=90" in rendered
     assert "@playwright/mcp@0.0.80" in rendered
     assert "default_tools_approval_mode" in rendered
     assert "enabled_tools" in rendered

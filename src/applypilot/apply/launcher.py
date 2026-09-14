@@ -134,6 +134,7 @@ def build_codex_command(model: str, port: int, worker_dir: Path,
         "-c", 'mcp_servers.playwright.command="npx"',
         "-c", f"mcp_servers.playwright.args={args_toml}",
         "-c", "mcp_servers.playwright.required=true",
+        "-c", "mcp_servers.playwright.startup_timeout_sec=90",
         "-c", f"mcp_servers.playwright.enabled_tools={tools_toml}",
         "-c", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
         "-c", 'web_search="disabled"',
@@ -164,6 +165,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if not target_url and _worker_count > 1:
+            _assign_unassigned_batches(conn, _worker_count)
 
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
@@ -237,7 +240,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
                   {site_clause}
                   {url_clauses}
                 ORDER BY
-                  CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END,
+                  CASE WHEN apply_status = 'failed' THEN 0 ELSE 1 END,
                   CASE
                     WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 0
                     WHEN COALESCE(application_url, url) LIKE '%workday%' THEN 1
@@ -298,7 +301,32 @@ def assign_worker_batches(worker_count: int) -> int:
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
+        assigned = _assign_unassigned_batches(conn, worker_count)
+        conn.commit()
+        return assigned
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _assign_unassigned_batches(conn, worker_count: int) -> int:
+    """Assign unowned eligible rows to the currently smallest fixed batch."""
+    counts = {worker: 0 for worker in range(worker_count)}
+    for worker, count in conn.execute(
+        """
+        SELECT apply_worker, COUNT(*)
+        FROM jobs
+        WHERE apply_worker IS NOT NULL
+          AND (apply_status IS NULL OR apply_status = 'in_progress'
+               OR (apply_status = 'failed'
+                   AND (apply_attempts IS NULL OR apply_attempts < ?)))
+        GROUP BY apply_worker
+        """,
+        (config.DEFAULTS["max_apply_attempts"],),
+    ):
+        if worker in counts:
+            counts[worker] = count
+    rows = conn.execute(
             """
             SELECT url
             FROM jobs
@@ -309,16 +337,14 @@ def assign_worker_batches(worker_count: int) -> int:
             """,
             (config.DEFAULTS["max_apply_attempts"],),
         ).fetchall()
-        for index, row in enumerate(rows):
-            conn.execute(
-                "UPDATE jobs SET apply_worker = ? WHERE url = ? AND apply_worker IS NULL",
-                (index % worker_count, row["url"]),
-            )
-        conn.commit()
-        return len(rows)
-    except Exception:
-        conn.rollback()
-        raise
+    for row in rows:
+        worker = min(counts, key=lambda candidate: (counts[candidate], candidate))
+        conn.execute(
+            "UPDATE jobs SET apply_worker = ? WHERE url = ? AND apply_worker IS NULL",
+            (worker, row["url"]),
+        )
+        counts[worker] += 1
+    return len(rows)
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -435,8 +461,14 @@ def _wait_for_captcha_resolution(job: dict, worker_id: int) -> bool:
     return False
 
 
-def _resolve_captcha(job: dict, worker_id: int, port: int) -> bool:
-    """Try CapSolver first, then fall back to the manual marker wait."""
+def _resolve_captcha(
+    job: dict,
+    worker_id: int,
+    port: int,
+    *,
+    allow_manual_wait: bool = True,
+) -> bool:
+    """Try CapSolver, optionally falling back to a visible manual wait."""
     from applypilot.apply.capsolver import is_enabled, try_solve_on_cdp
 
     if is_enabled():
@@ -448,7 +480,13 @@ def _resolve_captcha(job: dict, worker_id: int, port: int) -> bool:
                 return True
         except Exception:
             logger.exception("CapSolver auto-solve failed")
+        if not allow_manual_wait:
+            add_event(f"[W{worker_id}] CapSolver could not auto-solve in headless mode")
+            return False
         add_event(f"[W{worker_id}] CapSolver could not auto-solve; waiting for user")
+    elif not allow_manual_wait:
+        add_event(f"[W{worker_id}] CAPTCHA cannot be solved in headless mode")
+        return False
     return _wait_for_captcha_resolution(job, worker_id)
 
 
@@ -615,18 +653,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             errors="replace",
             env=env,
             cwd=str(worker_dir),
+            start_new_session=platform.system() != "Windows",
         )
         with _codex_lock:
             _codex_procs[worker_id] = proc
 
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
-
+        raw_output, _ = proc.communicate(
+            input=agent_prompt,
+            timeout=config.DEFAULTS["apply_timeout"],
+        )
+        returncode = proc.returncode
+        proc = None
         text_parts: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
-            for line in proc.stdout:
+            for line in raw_output.splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -647,10 +689,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
-
-        proc.wait(timeout=300)
-        returncode = proc.returncode
-        proc = None
 
         if returncode and returncode < 0:
             return "skipped", int((time.time() - start) * 1000)
@@ -701,6 +739,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                  last_action=f"FAILED: {reason[:25]}")
                     return f"failed:{reason}", duration_ms
             return "failed:unknown", duration_ms
+
+        if "required MCP servers failed to initialize" in raw_output:
+            add_event(f"[W{worker_id}] AGENT STARTUP FAILED ({elapsed}s)")
+            update_state(worker_id, status="failed", last_action="MCP startup failed")
+            return "failed:agent_startup_failed", duration_ms
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
@@ -784,6 +827,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    if worker_id and _stop_event.wait(timeout=worker_id * 3):
+        return applied, failed
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -825,8 +870,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     add_event(f"[W{worker_id}] CAPTCHA loop limit; marking failed")
                     result = "failed:captcha"
                     break
-                if not _resolve_captcha(job, worker_id, port):
-                    result = "skipped"
+                if not _resolve_captcha(
+                    job, worker_id, port, allow_manual_wait=not headless
+                ):
+                    result = "failed:captcha_unsolved"
                     break
                 captcha_rounds += 1
                 resumed_result, resumed_ms = run_job(

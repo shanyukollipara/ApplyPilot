@@ -137,6 +137,12 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active_per_worker
+        ON jobs(apply_worker)
+        WHERE apply_status = 'in_progress' AND apply_worker IS NOT NULL
+    """)
+    conn.commit()
 
     return conn
 

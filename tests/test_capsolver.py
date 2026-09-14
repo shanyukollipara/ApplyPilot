@@ -124,6 +124,27 @@ def test_resolve_captcha_uses_capsolver_before_manual_wait(monkeypatch):
     assert waited == []
 
 
+def test_headless_captcha_never_waits_for_manual_input(monkeypatch):
+    waited = []
+    monkeypatch.setattr(
+        launcher,
+        "_wait_for_captcha_resolution",
+        lambda job, worker_id: waited.append(True) or True,
+    )
+    monkeypatch.setattr("applypilot.apply.capsolver.is_enabled", lambda: True)
+    monkeypatch.setattr("applypilot.apply.capsolver.try_solve_on_cdp", lambda port: False)
+    monkeypatch.setattr(launcher, "add_event", lambda message: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+
+    assert launcher._resolve_captcha(
+        {"title": "Intern", "site": "Example"},
+        worker_id=1,
+        port=9323,
+        allow_manual_wait=False,
+    ) is False
+    assert waited == []
+
+
 def test_upsert_env_preserves_existing_keys(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     env_path.write_text("LLM_MODEL=qwen3:8b\nCAPSOLVER_API_KEY=\n", encoding="utf-8")

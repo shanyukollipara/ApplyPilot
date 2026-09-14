@@ -205,8 +205,19 @@ def _api_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "User-Agent": "ApplyPilot/0.3.0",
             },
         )
-        response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise CapSolverError("", "CapSolver returned a non-JSON response")
+        if response.is_error:
+            if isinstance(data, dict):
+                raise CapSolverError(
+                    str(data.get("errorCode") or response.status_code),
+                    str(data.get("errorDescription") or data.get("message")
+                        or f"CapSolver HTTP {response.status_code}"),
+                )
+            response.raise_for_status()
     if not isinstance(data, dict):
         raise CapSolverError("", "Unexpected CapSolver response")
     if data.get("errorId"):
