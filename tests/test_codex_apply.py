@@ -7,7 +7,8 @@ from applypilot.apply import launcher, codex_prompt as prompt
 from applypilot.database import init_db
 
 
-def _insert_job(conn, *, company: str, url: str, score: int = 10):
+def _insert_job(conn, *, company: str, url: str, score: int = 10,
+                title: str = "Software Engineer Intern"):
     conn.execute(
         """
         INSERT INTO jobs (
@@ -15,7 +16,7 @@ def _insert_job(conn, *, company: str, url: str, score: int = 10):
             tailored_resume_path, apply_attempts
         ) VALUES (?, ?, ?, ?, ?, ?, 0)
         """,
-        (url, "Software Engineer Intern", company, url, score, "/tmp/resume.txt"),
+        (url, title, company, url, score, "/tmp/resume.txt"),
     )
     conn.commit()
 
@@ -69,6 +70,34 @@ def test_acquire_job_excludes_degree_required_roles_in_url(tmp_path, monkeypatch
     assert launcher.acquire_job(target_url=target_url, min_score=0) is None
 
 
+@pytest.mark.parametrize("marker", [
+    "Graduate-Level-Co-op",
+    "Graduate-Researcher-Program",
+    "Graduate-Apprenticeship-Programme",
+])
+def test_acquire_job_excludes_graduate_roles_in_url(tmp_path, monkeypatch, marker):
+    conn = init_db(tmp_path / "graduate-url.db")
+    url = f"https://allowed.example/{marker}"
+    _insert_job(conn, company="Allowed Co", url=url)
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(launcher, "_load_blocked", lambda: ([], []))
+    monkeypatch.setattr(launcher.config, "is_manual_ats", lambda _: False)
+
+    assert launcher.acquire_job(target_url=url, min_score=0) is None
+
+
+def test_acquire_job_excludes_graduate_level_role_in_title(tmp_path, monkeypatch):
+    conn = init_db(tmp_path / "graduate-title.db")
+    url = "https://allowed.example/data-scientist"
+    _insert_job(conn, company="Allowed Co", url=url,
+                title="Data Scientist Graduate Level Co-op")
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(launcher, "_load_blocked", lambda: ([], []))
+    monkeypatch.setattr(launcher.config, "is_manual_ats", lambda _: False)
+
+    assert launcher.acquire_job(min_score=0) is None
+
+
 @pytest.mark.parametrize("result", [
     "failed:job_requires_PhD",
     "failed:job_requires_masters",
@@ -116,6 +145,25 @@ def test_acquire_job_removes_stale_failed_csv_row(tmp_path, monkeypatch):
 
     assert launcher.acquire_job(min_score=0)["url"] == url
     assert sync_calls == [conn]
+
+
+def test_acquire_job_finishes_pending_queue_before_retrying_failures(tmp_path, monkeypatch):
+    conn = init_db(tmp_path / "pending-before-retry.db")
+    failed_url = "https://allowed.example/a-failed"
+    pending_url = "https://allowed.example/z-pending"
+    _insert_job(conn, company="Allowed Co", url=failed_url)
+    _insert_job(conn, company="Allowed Co", url=pending_url)
+    conn.execute(
+        "UPDATE jobs SET apply_status = 'failed', apply_attempts = 1 WHERE url = ?",
+        (failed_url,),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+    monkeypatch.setattr(launcher, "_load_blocked", lambda: ([], []))
+    monkeypatch.setattr(launcher.config, "is_manual_ats", lambda _: False)
+    monkeypatch.setattr(launcher, "_sync_applications_csv", lambda _: None)
+
+    assert launcher.acquire_job(min_score=0)["url"] == pending_url
 
 
 def test_worker_loop_dry_run_does_not_record_result(monkeypatch):

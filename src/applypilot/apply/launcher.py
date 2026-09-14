@@ -54,6 +54,7 @@ _stop_event = threading.Event()
 # Track active Codex processes for skip (Ctrl+C) handling
 _codex_procs: dict[int, subprocess.Popen] = {}
 _codex_lock = threading.Lock()
+_csv_lock = threading.Lock()
 
 PLAYWRIGHT_MCP_VERSION = "0.0.80"
 EXCLUDED_COMPANIES = ("google", "coinbase")
@@ -179,6 +180,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
                   AND LOWER(url) NOT LIKE '%doctorate%'
                   AND LOWER(url) NOT LIKE '%graduate-student%'
                   AND LOWER(url) NOT LIKE '%graduate-intern%'
+                  AND LOWER(url) NOT LIKE '%graduate-level%'
+                  AND LOWER(url) NOT LIKE '%graduate-researcher%'
+                  AND LOWER(url) NOT LIKE '%graduate-apprentice%'
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -208,6 +212,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
                   AND LOWER(title) NOT LIKE '%doctorate%'
                   AND LOWER(title) NOT LIKE '%graduate student%'
                   AND LOWER(title) NOT LIKE '%graduate intern%'
+                  AND LOWER(title) NOT LIKE '%graduate-level%'
+                  AND LOWER(title) NOT LIKE '%graduate level%'
+                  AND LOWER(title) NOT LIKE '%graduate researcher%'
+                  AND LOWER(title) NOT LIKE '%graduate apprentice%'
                   AND LOWER(url) NOT LIKE '%master%'
                   AND LOWER(url) NOT LIKE '%mba%'
                   AND LOWER(url) NOT LIKE '%phd%'
@@ -216,9 +224,13 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
                   AND LOWER(url) NOT LIKE '%doctorate%'
                   AND LOWER(url) NOT LIKE '%graduate-student%'
                   AND LOWER(url) NOT LIKE '%graduate-intern%'
+                  AND LOWER(url) NOT LIKE '%graduate-level%'
+                  AND LOWER(url) NOT LIKE '%graduate-researcher%'
+                  AND LOWER(url) NOT LIKE '%graduate-apprentice%'
                   {site_clause}
                   {url_clauses}
                 ORDER BY
+                  CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END,
                   CASE
                     WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 0
                     WHEN COALESCE(application_url, url) LIKE '%workday%' THEN 1
@@ -334,20 +346,21 @@ def _sync_applications_csv(conn=None) -> None:
             config.APP_DIR / "applications.csv",
             Path(__file__).resolve().parents[3] / "applications.csv",
         ]
-        for destination in destinations:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            # Replace atomically so readers never observe a truncated export
-            # while the live worker is syncing results.
-            with tempfile.NamedTemporaryFile(
-                mode="w", newline="", encoding="utf-8",
-                dir=destination.parent, prefix=f".{destination.name}.tmp-",
-                delete=False,
-            ) as handle:
-                writer = csv.writer(handle)
-                writer.writerow(headers)
-                writer.writerows(rows)
-                temporary = Path(handle.name)
-            os.replace(temporary, destination)
+        with _csv_lock:
+            for destination in destinations:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # Replace atomically so readers never observe a truncated export
+                # while the live worker is syncing results.
+                with tempfile.NamedTemporaryFile(
+                    mode="w", newline="", encoding="utf-8",
+                    dir=destination.parent, prefix=f".{destination.name}.tmp-",
+                    delete=False,
+                ) as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+                    temporary = Path(handle.name)
+                os.replace(temporary, destination)
     finally:
         if close_conn:
             conn.close()
