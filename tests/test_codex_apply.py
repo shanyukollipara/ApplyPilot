@@ -233,6 +233,7 @@ def test_codex_command_is_ephemeral_read_only_and_ignores_user_config(tmp_path):
     assert "--ignore-rules" in command
     assert "--ephemeral" in command
     assert "--sandbox read-only" in rendered
+    assert 'model_reasoning_effort="medium"' in rendered
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert "--disable shell_tool" in rendered
     assert 'web_search="disabled"' in rendered
