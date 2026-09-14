@@ -166,6 +166,24 @@ def test_acquire_job_finishes_pending_queue_before_retrying_failures(tmp_path, m
     assert launcher.acquire_job(min_score=0)["url"] == pending_url
 
 
+def test_assign_worker_batches_persists_even_partition(tmp_path, monkeypatch):
+    conn = init_db(tmp_path / "worker-batches.db")
+    for index in range(7):
+        _insert_job(
+            conn,
+            company="Allowed Co",
+            url=f"https://allowed.example/job-{index}",
+        )
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    assert launcher.assign_worker_batches(3) == 7
+    counts = conn.execute(
+        "SELECT apply_worker, COUNT(*) FROM jobs GROUP BY apply_worker ORDER BY apply_worker"
+    ).fetchall()
+    assert [tuple(row) for row in counts] == [(0, 3), (1, 2), (2, 2)]
+    assert launcher.assign_worker_batches(3) == 0
+
+
 def test_worker_loop_dry_run_does_not_record_result(monkeypatch):
     job = {"url": "https://allowed.example/dry-run", "title": "Dry run job"}
     results = iter([job])

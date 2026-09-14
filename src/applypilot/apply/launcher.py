@@ -26,7 +26,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
+from applypilot.database import get_connection, init_db
 from applypilot.apply import chrome, dashboard, codex_prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -55,6 +55,7 @@ _stop_event = threading.Event()
 _codex_procs: dict[int, subprocess.Popen] = {}
 _codex_lock = threading.Lock()
 _csv_lock = threading.Lock()
+_worker_count = 1
 
 PLAYWRIGHT_MCP_VERSION = "0.0.80"
 EXCLUDED_COMPANIES = ("google", "coinbase")
@@ -188,6 +189,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             params: list = [config.DEFAULTS["max_apply_attempts"]]
+            worker_clause = ""
+            if _worker_count > 1:
+                worker_clause = "AND apply_worker = ?"
+                params.append(worker_id)
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -227,6 +232,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
                   AND LOWER(url) NOT LIKE '%graduate-level%'
                   AND LOWER(url) NOT LIKE '%graduate-researcher%'
                   AND LOWER(url) NOT LIKE '%graduate-apprentice%'
+                  {worker_clause}
                   {site_clause}
                   {url_clauses}
                 ORDER BY
@@ -279,6 +285,36 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
         # Always use the master resume — enrich/score/tailor stages are removed.
         job["tailored_resume_path"] = str(config.RESUME_PATH)
         return job
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def assign_worker_batches(worker_count: int) -> int:
+    """Persistently divide eligible jobs across fixed worker IDs."""
+    if worker_count < 1:
+        raise ValueError("worker_count must be positive")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT url
+            FROM jobs
+            WHERE apply_worker IS NULL
+              AND (apply_status IS NULL OR apply_status = 'failed')
+              AND (apply_attempts IS NULL OR apply_attempts < ?)
+            ORDER BY CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END, url
+            """,
+            (config.DEFAULTS["max_apply_attempts"],),
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE jobs SET apply_worker = ? WHERE url = ? AND apply_worker IS NULL",
+                (index % worker_count, row["url"]),
+            )
+        conn.commit()
+        return len(rows)
     except Exception:
         conn.rollback()
         raise
@@ -872,12 +908,18 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
     """
-    global POLL_INTERVAL
+    global POLL_INTERVAL, _worker_count
     POLL_INTERVAL = poll_interval
+    _worker_count = max(1, workers)
     _stop_event.clear()
 
     config.ensure_dirs()
+    init_db()
     console = Console()
+    assigned = assign_worker_batches(_worker_count)
+    if assigned:
+        logger.info("Assigned %d unassigned jobs across %d fixed worker batches",
+                    assigned, _worker_count)
 
     if continuous:
         effective_limit = 0
