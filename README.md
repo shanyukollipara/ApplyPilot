@@ -4,6 +4,8 @@
 
 # ApplyPilot
 
+Teaching a class with this fork? Start with [docs/CLASSROOM.md](docs/CLASSROOM.md).
+
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)

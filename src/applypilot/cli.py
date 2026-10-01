@@ -234,6 +234,23 @@ def apply(
     )
 
 
+@app.command("sync-simplify")
+def sync_simplify() -> None:
+    """Import unseen Summer 2027 internships from the Simplify job board."""
+    _bootstrap()
+    from applypilot.apply.launcher import assign_worker_batches
+    from applypilot.discovery.simplify import sync_listings
+
+    result = sync_listings()
+    assigned = assign_worker_batches(10)
+    console.print(
+        "[green]Simplify sync[/green] "
+        f"received={result['received']} inserted={result['inserted']} "
+        f"skipped={result['skipped']} excluded={result['excluded']} "
+        f"assigned={assigned}"
+    )
+
+
 @app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
@@ -380,7 +397,21 @@ def doctor() -> None:
             results.append(("CapSolver API key", warn_mark, f"set, but unverified ({exc})"))
     else:
         results.append(("CapSolver API key", warn_mark,
-                        "Optional — set CAPSOLVER_API_KEY in ~/.applypilot/.env to auto-solve CAPTCHAs"))
+                        "Optional — set CAPSOLVER_API_KEY in ~/.applypilot/.env for reCAPTCHA/Turnstile"))
+
+    nopecha_key = os.environ.get("NOPECHA_API_KEY", "").strip()
+    if nopecha_key:
+        try:
+            from applypilot.apply.nopecha import get_status
+            status = get_status()
+            credit = status.get("credit")
+            plan = status.get("plan") or "active"
+            results.append(("NopeCHA API key", ok_mark, f"{plan}, {credit} credits"))
+        except Exception as exc:
+            results.append(("NopeCHA API key", warn_mark, f"set, but unverified ({exc})"))
+    else:
+        results.append(("NopeCHA API key", warn_mark,
+                        "Optional — set NOPECHA_API_KEY in ~/.applypilot/.env for hCaptcha"))
 
     # --- Render results ---
     console.print()
@@ -402,6 +433,136 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Codex CLI + Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+@app.command("icims-lab")
+def icims_lab(
+    url: Optional[str] = typer.Option(None, "--url", help="Plan/probe/apply one job URL."),
+    limit: int = typer.Option(8, "--limit", "-l", help="How many held iCIMS jobs to plan."),
+    search_boards: bool = typer.Option(
+        False, "--search-boards",
+        help="Also search Indeed/LinkedIn/ZipRecruiter (slow, network).",
+    ),
+    probe: bool = typer.Option(
+        False, "--probe",
+        help="Open isolated Chrome on port 9362 and read login/captcha signals.",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="Run one isolated Luna apply on worker 40. Default is dry-run.",
+    ),
+    submit: bool = typer.Option(
+        False, "--submit",
+        help="With --apply, actually submit instead of dry-run.",
+    ),
+    headed: bool = typer.Option(
+        False, "--headed",
+        help="Show the lab Chrome window (port 9362). Live fleet stays headless.",
+    ),
+    model: str = typer.Option("gpt-5.6-luna", "--model", "-m"),
+    csv_path: Optional[str] = typer.Option(
+        None, "--csv", help="Apply only jobs from this CSV. Isolated from the live fleet.",
+    ),
+    workers: int = typer.Option(
+        1, "--workers", "-w", help="Initial isolated iCIMS workers (IDs 40+). Default 1.",
+    ),
+    max_workers: int = typer.Option(
+        4, "--max-workers", help="Cap when scaling up as live fleet Chromes free.",
+    ),
+    watch_fleet: bool = typer.Option(
+        True, "--watch-fleet/--no-watch-fleet",
+        help="Add isolated workers only as live fleet ports 9322-9337 free.",
+    ),
+) -> None:
+    """Plan and test iCIMS routes without touching the live Workday fleet."""
+    _bootstrap()
+    from applypilot.apply import icims
+    from applypilot.database import get_connection, init_db
+
+    init_db()
+    conn = get_connection()
+
+    if csv_path:
+        from applypilot.apply import nopecha as nopecha_mod
+        if not nopecha_mod.is_enabled():
+            console.print("[red]NOPECHA_API_KEY is not set. hCaptcha cannot be handed off.[/red]")
+            raise typer.Exit(code=1)
+        console.print(
+            f"Isolated iCIMS CSV run workers={workers} max={max_workers} "
+            f"submit={submit} headed={headed} (live fleet untouched)"
+        )
+        applied, failed = icims.run_csv_queue(
+            csv_path,
+            workers=workers,
+            max_workers=max_workers,
+            watch_fleet=watch_fleet,
+            submit=submit,
+            headed=headed,
+            model=model,
+        )
+        console.print(f"CSV result applied={applied} failed={failed}")
+        raise typer.Exit(code=0 if failed == 0 or applied else 1)
+
+    jobs = icims.lab_jobs(conn, url=url, limit=1 if (url or apply or probe) else limit)
+    if not jobs:
+        console.print("[yellow]No iCIMS jobs found to plan.[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="iCIMS lab routes (live fleet unchanged)", show_header=True, header_style="bold cyan")
+    table.add_column("Company", max_width=22)
+    table.add_column("Title", max_width=28)
+    table.add_column("Class")
+    table.add_column("Route")
+    table.add_column("Conf", justify="right")
+    table.add_column("Apply URL", max_width=42)
+    table.add_column("Why", max_width=28)
+
+    plans: list[tuple[dict, object]] = []
+    for job in jobs:
+        plan = icims.plan_job(job, conn=conn, search=search_boards, captcha_provider="nopecha")
+        icims.persist_plan(conn, job["url"], plan)
+        plans.append((job, plan))
+        table.add_row(
+            (job.get("site") or "")[:22],
+            (job.get("title") or "")[:28],
+            plan.classification,
+            plan.route,
+            f"{plan.confidence:.2f}",
+            (plan.apply_url or "")[:42],
+            ", ".join(plan.reasons)[:28],
+        )
+    console.print(table)
+
+    if probe:
+        target = url or icims.job_apply_url(jobs[0])
+        console.print(f"\nProbing [bold]{target}[/bold] on port {icims.LAB_CDP_PORT}...")
+        signals = icims.lab_probe(target, headless=not headed)
+        console.print(signals or "[red]probe failed[/red]")
+        job = jobs[0]
+        plan = icims.plan_job(job, conn=conn, signals=signals, search=search_boards)
+        icims.persist_plan(conn, job["url"], plan)
+        console.print(f"Updated route: [bold]{plan.route}[/bold] ({plan.confidence:.2f}) {plan.reasons}")
+        if not apply:
+            return
+
+    if apply:
+        job, plan = plans[0]
+        if plan.route == icims.ROUTE_SKIP:
+            console.print("[yellow]Route is skip (hCaptcha/classic with no mirror). Not launching Chrome.[/yellow]")
+            raise typer.Exit(code=2)
+        console.print(
+            f"\nLab apply worker={icims.LAB_WORKER_ID} port={icims.LAB_CDP_PORT} "
+            f"route={plan.route} dry_run={not submit}"
+        )
+        applied, failed = icims.lab_apply_one(
+            job["url"],
+            apply_url=plan.apply_url,
+            headless=not headed,
+            dry_run=not submit,
+            model=model,
+        )
+        console.print(f"Lab result applied={applied} failed={failed}")
+        raise typer.Exit(code=0 if applied else 1)
 
 
 if __name__ == "__main__":

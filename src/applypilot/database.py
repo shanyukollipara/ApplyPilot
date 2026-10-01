@@ -137,6 +137,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    ensure_apply_trials(conn)
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active_per_worker
         ON jobs(apply_worker)
@@ -187,8 +188,43 @@ _ALL_COLUMNS: dict[str, str] = {
     "last_attempted_at": "TEXT",
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
-    "verification_confidence": "TEXT",
+    "apply_route": "TEXT",
+    "icims_mirror_url": "TEXT",
 }
+
+
+def ensure_apply_trials(conn: sqlite3.Connection) -> None:
+    """Create the research trial log. Never store tokens, passwords, or cookies."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS apply_trials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT,
+            finished_at TEXT,
+            job_url TEXT,
+            job_id TEXT,
+            company TEXT,
+            title TEXT,
+            ats TEXT,
+            entry_host TEXT,
+            final_host TEXT,
+            route_used TEXT,
+            captcha_provider TEXT,
+            captcha_checkpoint TEXT,
+            time_to_checkpoint_ms INTEGER,
+            provider_result TEXT,
+            login_result TEXT,
+            profile_result TEXT,
+            submit_result TEXT,
+            confirmation_detected INTEGER,
+            total_runtime_ms INTEGER,
+            worker_id INTEGER,
+            captcha_type TEXT,
+            apply_status TEXT
+        )
+        """
+    )
+    conn.commit()
 
 
 def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:

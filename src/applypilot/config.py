@@ -13,7 +13,14 @@ DB_PATH = APP_DIR / "applypilot.db"
 PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
-TRANSCRIPT_PATH = Path("/Users/Claw/Downloads/University_of_Texas_Academic_Summary.pdf")
+
+
+def transcript_path() -> Path:
+    """Optional transcript PDF. File at ~/.applypilot/transcript.pdf, or APPLYPILOT_TRANSCRIPT."""
+    configured = os.environ.get("APPLYPILOT_TRANSCRIPT")
+    if configured:
+        return Path(configured).expanduser()
+    return APP_DIR / "transcript.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 
@@ -73,6 +80,47 @@ def get_chrome_path() -> str:
     raise FileNotFoundError(
         "Chrome/Chromium not found. Install Chrome or set CHROME_PATH environment variable."
     )
+
+
+def _playwright_cache_roots() -> list[Path]:
+    system = platform.system()
+    if system == "Darwin":
+        return [Path.home() / "Library/Caches/ms-playwright"]
+    if system == "Windows":
+        return [Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"]
+    return [Path.home() / ".cache/ms-playwright"]
+
+
+def get_chrome_for_testing_path() -> str | None:
+    """Chrome for Testing / Playwright Chromium. Branded Chrome 137+ ignores --load-extension."""
+    override = os.environ.get("CHROME_FOR_TESTING_PATH", "").strip()
+    if override and Path(override).exists():
+        return override
+
+    found: list[Path] = []
+    for root in _playwright_cache_roots():
+        if not root.is_dir():
+            continue
+        found.extend(root.glob(
+            "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        ))
+        found.extend(root.glob("chromium-*/chrome-linux*/chrome"))
+        found.extend(root.glob("chromium-*/chrome-win*/chrome.exe"))
+    existing = [path for path in found if path.is_file()]
+
+    def _rev(path: Path) -> int:
+        for part in path.parts:
+            if part.startswith("chromium-") and part[9:].isdigit():
+                return int(part[9:])
+        return 0
+
+    if existing:
+        existing.sort(key=_rev)
+        return str(existing[-1])
+    app = Path("/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
+    if app.exists():
+        return str(app)
+    return None
 
 
 def get_chrome_user_data() -> Path:
@@ -164,13 +212,18 @@ def load_base_urls() -> dict[str, str | None]:
 
 DEFAULTS = {
     "min_score": 7,
-    "max_apply_attempts": 2,
+    "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
-    "apply_timeout": 300,
+    "apply_timeout": 540,
+    "job_gap_seconds": 18,
     "viewport": "1280x900",
     "capsolver_poll_interval": 2,
     "capsolver_timeout": 120,
+    "nopecha_poll_interval": 2,
+    "nopecha_timeout": 90,
+    "captcha_provider_timeout": 90,
+    "captcha_headed_wait_seconds": 90,
 }
 
 

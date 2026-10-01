@@ -22,7 +22,26 @@ def test_task_from_detection_maps_supported_types():
         "websiteURL": "https://jobs.example/apply",
         "websiteKey": "6LeExample",
     }
+    v3 = capsolver.task_from_detection({
+        "type": "recaptcha_v3",
+        "websiteURL": "https://jobs.example/apply",
+        "websiteKey": "6LeExample",
+    })
+    assert v3["type"] == "ReCaptchaV3TaskProxyLess"
+    assert v3["pageAction"] == "submit"
+    enterprise = capsolver.task_from_detection({
+        "type": "recaptcha_v3_enterprise",
+        "websiteURL": "https://jobs.example/apply",
+        "websiteKey": "6LeExample",
+    })
+    assert enterprise["type"] == "ReCaptchaV3EnterpriseTaskProxyLess"
+    assert enterprise["pageAction"] == "submit"
     assert capsolver.task_from_detection({"type": "turnstile", "websiteURL": "https://x"}) is None
+    assert capsolver.task_from_detection({
+        "type": "hcaptcha",
+        "websiteURL": "https://careers.example.com/login",
+        "websiteKey": "9ff49460-aaaaaaaa-bbbb-cccc-dddddddddddd",
+    }) is None
 
 
 def test_solve_creates_task_then_polls(monkeypatch):
@@ -106,9 +125,11 @@ def test_prompt_mentions_capsolver_when_enabled(tmp_path, monkeypatch):
     )
 
     lower = text.lower()
-    assert "capsolver" in lower
     assert "do not solve" in lower
-    assert "wait up to 45 seconds" in lower
+    assert "do not click" in lower
+    assert "output result:captcha immediately" in lower
+    assert "hcaptcha" in lower
+    assert "wait up to 90 seconds" not in lower
     assert profile["personal"]["password"] not in text
 
 
@@ -116,12 +137,44 @@ def test_resolve_captcha_uses_capsolver_before_manual_wait(monkeypatch):
     waited = []
     monkeypatch.setattr(launcher, "_wait_for_captcha_resolution", lambda job, worker_id: waited.append(True) or False)
     monkeypatch.setattr("applypilot.apply.capsolver.is_enabled", lambda: True)
+    monkeypatch.setattr("applypilot.apply.capsolver.inspect_live_captcha", lambda port: None)
     monkeypatch.setattr("applypilot.apply.capsolver.try_solve_on_cdp", lambda port: True)
     monkeypatch.setattr(launcher, "add_event", lambda message: None)
     monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
 
-    assert launcher._resolve_captcha({"title": "Intern", "site": "Example"}, worker_id=1, port=9323) is True
+    assert launcher._resolve_captcha({"title": "Intern", "site": "Example"}, worker_id=1, port=9323) == (True, None)
     assert waited == []
+
+
+def test_resolve_captcha_skips_unsupported_hcaptcha(monkeypatch):
+    waited = []
+    solved = []
+    monkeypatch.setattr(launcher, "_wait_for_captcha_resolution", lambda job, worker_id: waited.append(True) or True)
+    monkeypatch.setattr("applypilot.apply.capsolver.is_enabled", lambda: True)
+    monkeypatch.setattr("applypilot.apply.nopecha.is_enabled", lambda: False)
+    monkeypatch.setattr(
+        "applypilot.apply.capsolver.inspect_live_captcha",
+        lambda port: {
+            "type": "hcaptcha",
+            "websiteKey": "9ff49460-test",
+            "websiteURL": "https://careers.example.com/login",
+            "frameURL": "https://newassets.hcaptcha.com/captcha",
+            "responsePresent": True,
+            "responseLength": 0,
+        },
+    )
+    monkeypatch.setattr("applypilot.apply.capsolver.try_solve_on_cdp", lambda port: solved.append(True) or True)
+    monkeypatch.setattr(launcher, "add_event", lambda message: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+
+    assert launcher._resolve_captcha(
+        {"title": "Intern", "site": "Example"},
+        worker_id=1,
+        port=9323,
+        allow_manual_wait=True,
+    ) == (False, "hcaptcha")
+    assert waited == []
+    assert solved == []
 
 
 def test_headless_captcha_never_waits_for_manual_input(monkeypatch):
@@ -132,6 +185,7 @@ def test_headless_captcha_never_waits_for_manual_input(monkeypatch):
         lambda job, worker_id: waited.append(True) or True,
     )
     monkeypatch.setattr("applypilot.apply.capsolver.is_enabled", lambda: True)
+    monkeypatch.setattr("applypilot.apply.capsolver.inspect_live_captcha", lambda port: None)
     monkeypatch.setattr("applypilot.apply.capsolver.try_solve_on_cdp", lambda port: False)
     monkeypatch.setattr(launcher, "add_event", lambda message: None)
     monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
@@ -141,7 +195,7 @@ def test_headless_captcha_never_waits_for_manual_input(monkeypatch):
         worker_id=1,
         port=9323,
         allow_manual_wait=False,
-    ) is False
+    ) == (False, None)
     assert waited == []
 
 

@@ -75,9 +75,6 @@ def build_prompt(job: dict, tailored_resume: str,
     """Build the prompt used by the isolated Codex browser worker."""
     profile = config.load_profile()
     company = (job.get("site") or "").strip()
-    if company.lower() in {"google", "coinbase"}:
-        raise ValueError(f"Excluded company: {company}")
-
     resume_base = Path(job.get("tailored_resume_path") or "")
     resume_pdf = resume_base.with_suffix(".pdf").resolve()
     if not resume_pdf.exists():
@@ -87,42 +84,59 @@ def build_prompt(job: dict, tailored_resume: str,
     upload_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = upload_dir / f"{profile['personal']['full_name'].replace(' ', '_')}_Resume.pdf"
     shutil.copyfile(resume_pdf, upload_pdf)
-    transcript_pdf = config.TRANSCRIPT_PATH.expanduser().resolve()
-    if not transcript_pdf.exists():
-        raise ValueError(f"Transcript PDF not found: {transcript_pdf}")
-    upload_transcript = upload_dir / "University_of_Texas_Academic_Summary.pdf"
-    shutil.copyfile(transcript_pdf, upload_transcript)
+    transcript_pdf = config.transcript_path()
+    upload_transcript = None
+    if transcript_pdf.exists():
+        upload_transcript = upload_dir / transcript_pdf.name
+        shutil.copyfile(transcript_pdf, upload_transcript)
+    transcript_line = (
+        f"Transcript PDF to upload when requested: {upload_transcript}"
+        if upload_transcript
+        else "No transcript PDF is configured. If the form requires one, stop with RESULT:FAILED:manual_question:transcript_required."
+    )
 
     submit_rule = (
         "Do not click the final Submit/Apply button. Review the completed form and output RESULT:DRY_RUN."
         if dry_run else
         "Before the final click, review every field against the profile and resume. Then submit only if all answers are supported."
     )
-    if resume_current_page and capsolver_enabled:
+    if resume_current_page:
         opening_step = (
-            "A CAPTCHA was handed to CapSolver on this same page and a solver token was injected. Do not navigate away or reload. Snapshot the current page and continue. Treat the CAPTCHA as already solved even if the checkbox still looks unchecked — do NOT output RESULT:CAPTCHA again. Preserve the existing resume field when it already contains the uploaded filename or pasted resume text. Verify other supported fields, accept any remaining authorized SMS/recruiting consent checkboxes if needed to submit, then follow the submit rule immediately."
-        )
-    elif resume_current_page:
-        opening_step = (
-            "The user has manually completed the CAPTCHA in the open browser. Do not navigate away or reload. Snapshot the current page and continue the same application from its current state. Preserve the existing resume field when it already contains the uploaded filename or pasted resume text and satisfies the required field. Do not re-upload or switch its input mode in that case."
+            "A CAPTCHA-handling component attempted the challenge on this same open page. Do not navigate away or reload. Do not click or reason through CAPTCHA widgets. Snapshot the current page and continue the same application from its current state. Treat a previously handed-off CAPTCHA as handled even if the checkbox still looks unchecked — do NOT output RESULT:CAPTCHA again unless a NEW challenge appears. Preserve the existing resume field when it already contains the uploaded filename or pasted resume text and satisfies the required field. Do not re-upload or switch its input mode in that case."
         )
     else:
         opening_step = "Navigate directly to the job URL and confirm the title/company are consistent."
     captcha_rule = (
-        "Do not solve or bypass a CAPTCHA yourself. If a CAPTCHA blocks access or is the final control, fill every non-CAPTCHA field first, wait up to 45 seconds for CapSolver/the user to resolve it, then stop with RESULT:CAPTCHA."
-        if capsolver_enabled else
-        "Do not solve or bypass a CAPTCHA. If a CAPTCHA blocks access to the form, stop with RESULT:CAPTCHA. If an unchecked CAPTCHA is merely the final control on an otherwise usable form, fill and verify every non-CAPTCHA field first, then stop with RESULT:CAPTCHA immediately before submission so the user solves it only after the form is ready."
+        "Do not solve, click, or reason through a CAPTCHA widget. "
+        "A footer that only says the site is protected by reCAPTCHA is not a challenge — continue the form. "
+        "If the page shows an actual widget (hCaptcha on hcaptcha.com / .h-captcha / textarea[name=h-captcha-response], "
+        "a reCAPTCHA checkbox or image iframe such as recaptcha/api2 or recaptcha/enterprise, Turnstile, or similar), "
+        "output RESULT:CAPTCHA immediately. Do not wait for it to resolve. "
+        "The launcher will pause you, attempt the configured provider in this same browser, and resume you on the same page."
     )
     captcha_step = (
-        "If an unchecked CAPTCHA is the final remaining control and CapSolver has NOT yet been invoked on this page, output RESULT:CAPTCHA now so CapSolver can finish it. After you are resumed on the same page with CapSolver enabled, NEVER output RESULT:CAPTCHA again — assume the token is injected, click Submit/Apply, and report APPLIED or a non-CAPTCHA failure."
-        if capsolver_enabled else
-        "If an unchecked CAPTCHA is the final remaining control, output RESULT:CAPTCHA now. After the user resumes you on the same page, verify it is solved and all non-CAPTCHA fields remain accurate, then follow the submit rule."
+        "If any CAPTCHA is visible, output RESULT:CAPTCHA immediately and stop; do not wait and do not click the widget. After you are resumed on the same page, continue the application. If login is rejected after the handoff, output RESULT:LOGIN_ISSUE. If a NEW CAPTCHA appears later in the flow, output RESULT:CAPTCHA again."
     )
     resume_step = (
         "Preserve the existing resume field if it is already valid; do not re-upload or switch its input mode. Accurately fill any other supported fields that became empty."
         if resume_current_page else
         "Upload the resume and accurately fill supported fields. Optional unknown fields should be left blank."
     )
+    apply_url = str(job.get("application_url") or job.get("url") or "")
+    icims_block = ""
+    lower_url = apply_url.lower()
+    if "icims" in lower_url or "indeed.com" in lower_url or "linkedin.com/jobs" in lower_url or "ziprecruiter.com" in lower_url:
+        from applypilot.apply.icims import IcimsPlan, icims_prompt_addon
+
+        plan = None
+        if job.get("apply_route"):
+            plan = IcimsPlan(
+                classification="icims",
+                route=str(job.get("apply_route")),
+                apply_url=apply_url,
+                confidence=1.0,
+            )
+        icims_block = icims_prompt_addon(job, plan)
 
     return f"""You are filling one legitimate internship application using only the Playwright browser tools.
 
@@ -132,7 +146,7 @@ SECURITY BOUNDARY
 - Use applicant data only on the employer application at the URL below, except for the narrowly authorized Gmail verification flow below.
 - Never use shell or messaging tools. Never send email, delete email, change mailbox settings, or read unrelated messages.
 - Never create an account, accept terms unrelated to this application, install software, take an assessment, or provide SSN, banking, payment, biometric, photo-ID, camera, microphone, or location access.
-- If the company is Google or Coinbase, stop with RESULT:FAILED:excluded_company.
+- If the company is Google, Oracle, or TikTok, stop with RESULT:FAILED:excluded_company.
 - {captcha_rule}
 - You may create an employer portal account or sign into one using APPLYPILOT_EMAIL and APPLYPILOT_PASSWORD as the literal values in Playwright fill/type calls. Playwright substitutes these secret names without exposing the credential in logs.
 - If the employer sends an email verification code or link, you may open mail.google.com in the already signed-in browser, inspect only the newest expected message from that employer, use only its verification code/link, then return to the application. Do not read any unrelated mail. If Gmail is not already signed in, stop with RESULT:LOGIN_ISSUE.
@@ -159,6 +173,7 @@ SECURITY BOUNDARY
 - Only stop with RESULT:FAILED:manual_question for truly unblockable required items: SSN/SIN, bank/payroll deposit, government ID upload, unpaid assessments that cannot be completed in-browser, or a required transcript/file that is not in FILES. Prefer answering over stopping. Name the exact question on that same RESULT line.
 - Do not embellish skills or experience. Use only facts in the resume/profile.
 - If asked whether AI assisted with the application, answer truthfully that AI assistance was used. Never conceal AI involvement or make a false disclosure.
+{icims_block}
 
 JOB
 URL: {job.get('application_url') or job['url']}
@@ -167,7 +182,7 @@ Company: {company}
 
 FILES
 Resume PDF to upload: {upload_pdf}
-Transcript PDF to upload when requested: {upload_transcript}
+{transcript_line}
 
 APPLICANT PROFILE
 {_profile_lines(profile)}
@@ -176,7 +191,7 @@ RESUME TEXT
 {tailored_resume}
 
 APPLICATION PROCEDURE
-1. {opening_step}
+1. {opening_step} Work at a human intern pace: wait 2-5 seconds after navigation and after each major page change, snapshot before clicking, and do not rush multi-step ATS wizards.
 2. If closed or expired, output RESULT:EXPIRED.
 3. Open the employer's application form. Stop if redirected to a materially unrelated domain or non-job marketplace.
 4. Immediately dismiss cookie/consent banners. Prefer "Accept" / "Accept All" / "Accept Cookies" / "Agree" / "I Agree" (do not fight for Decline). If Accept Cookies click fails or times out once: navigate directly past the banner — for Workday job pages use browser_navigate to `{{jobUrl}}/apply/applyManually` (strip query params; if URL already ends with /apply, use `{{jobUrl}}/applyManually`). Do not loop on the cookie dialog and do not spam keyboard keys there.
@@ -185,14 +200,14 @@ APPLICATION PROCEDURE
    - If a click times out because the control is not "stable"/intercepted, do NOT immediately fail. Dismiss overlays, wait 2-4s, scroll the control into view, re-snapshot, and retry the same control up to 2 times.
    - Prefer durable selectors when refs go stale: button[data-automation-id='pageFooterNextButton'], a[data-automation-id='autofillWithResume'], a[data-automation-id='applyManually'], button[data-automation-id='createAccountSubmitButton'], button[data-automation-id='signInSubmitButton'], input[data-automation-id*='file'], and labeled radio inputs by name/value.
    - After resume upload, wait until processing finishes (filename visible / spinner gone) before clicking Next.
-   - If "Select files"/"Upload" opens a native file chooser, click the upload control first, then use browser_file_upload with the appropriate resume or transcript PDF path from FILES above; do not click Select file repeatedly without uploading. If no modal appears, re-snapshot and target the hidden input[type=file] directly.
+   - If "Select files"/"Upload" opens a native file chooser, click the upload control first, then use browser_file_upload with the appropriate resume or transcript PDF path from FILES above; do not click Select file repeatedly without uploading. If no modal appears, re-snapshot and target the hidden input[type=file] directly. Never output RESULT:FAILED:resume_pdf_conflicts_with_profile. If Indeed's parsed work history or education looks different from the profile, still click Continue with the already selected/uploaded session resume PDF and submit; do not loop on Resume options or delete parsed rows.
    - If Apply / Autofill with Resume / Apply Manually clicks fail twice: browser_navigate straight to `{{jobUrl}}/apply/applyManually` (or `/apply/autofillWithResume` when resuming with the PDF). Then fill Create Account / Sign In from the profile.
    - If Create Account submit click fails after fields are filled: press Enter once in the Verify Password field, or switch to Sign In with the same email/password (account may already exist from a prior attempt) and continue.
    - Greenhouse/Lever/Workable resume or transcript uploads: prefer the hidden input[type=file] via browser_file_upload with the appropriate PDF path. Do not thrash the visible "Attach"/"Upload" button if the native chooser does not open; re-snapshot and target the file input ref directly.
    - For Yes/No radios (e.g. previously employed), click the visible text label beside the radio if the input itself is not clickable. Required non-EEO radios may use one Space keypress only after focusing the exact labeled option; never arrow across options.
    - Sticky footer Next/Submit buttons often need a scroll-to-bottom before click.
    - Application terms checkboxes: click the checkbox or the "I have read and consent/agree" label — never Decline. If a privacy/terms modal appears, Accept and continue.
-   - Workday School/University (and similar typeahead) search boxes: typing alone does NOT set the value. Clear the box first (select-all/delete or fill empty), type the exact query "University of Texas at Austin", wait up to 5 seconds for the listbox/options, then click the exact matching option. Confirm a selected chip/token appears — not just free text in the search box — before clicking Next. If there are no options, clear and retry once with "UT Austin"; only then choose the list option "School Unavailable" (never append that text into a partially filled search box). Same pattern for Field of Study and other searchable multi-selects.
+   - School/University typeaheads (Workday, Greenhouse, Lever, and similar): typing alone does NOT set the value. Clear the box first (select-all/delete or fill empty), type the exact query "University of Texas at Austin", wait up to 5 seconds for the listbox/options, then click the exact matching option. Confirm a selected chip/token appears — not just free text in the search box — before clicking Next. If there are no options, clear and retry once with "UT Austin"; only then choose the list option "School Unavailable" (never append that text into a partially filled search box). Same pattern for Field of Study and other searchable multi-selects. Never stop with RESULT:FAILED:manual_question:School or RESULT:FAILED:manual_question:University — the school is always University of Texas at Austin.
    - Only output RESULT:FAILED:browser_interaction_blocked after URL-navigation recovery AND Sign In/Create Account recovery still cannot advance a required control. Cookie-banner click failures alone are never enough for that result.
 7. For compensation on this internship, use $30/hour USD when the field requests an hourly preference. If a plain "Desired salary" field does not specify a unit, enter "$30/hour" so the unit is explicit. Use $62,400 USD only when the form explicitly requires an annual amount. Do not accept an offer or negotiate terms.
 8. The applicant is willing to relocate anywhere in the United States. When a form asks for one preferred location, choose Dallas/DFW if offered; otherwise choose the job's listed U.S. location.
@@ -202,6 +217,7 @@ APPLICATION PROCEDURE
    - Age 18+: Yes
    - Employment type sought: Internship (not Full Time/Part Time unless Internship is unavailable)
    - High school diploma or GED: Yes
+   - School / University / College: University of Texas at Austin
    - Will work overtime if required: Yes
    - Authorized to work in U.S.: Yes
    - Require sponsorship now or in future: No
@@ -222,7 +238,7 @@ APPLICATION PROCEDURE
    - GPA: 4.00
    - If asked "highest level of education completed", choose High School Diploma / GED or "Some College" / "Bachelor's in progress" as the closest accurate option — never claim a completed bachelor's degree.
    - If asked about plans after graduation / career goals: continue finishing the B.S. at UT Austin (May 2028), then pursue a full-time software engineering role; for this internship, eager to learn and contribute on the team.
-   - If a required unofficial/official transcript upload is requested, upload `University_of_Texas_Academic_Summary.pdf` from FILES above (do not upload the resume as a transcript). Only stop with RESULT:FAILED:manual_question:transcript_required if that transcript file is unavailable.
+   - If a required unofficial/official transcript upload is requested and FILES lists a transcript PDF, upload that file (do not upload the resume as a transcript). If no transcript is configured, stop with RESULT:FAILED:manual_question:transcript_required.
 13. For open-ended answers and cover letters, write natural, specific prose tied directly to the resume and job description. Do not invent claims and do not use tools intended to disguise AI involvement.
 14. {captcha_step}
 15. {submit_rule}

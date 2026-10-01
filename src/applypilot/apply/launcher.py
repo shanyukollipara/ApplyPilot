@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.live import Live
@@ -55,10 +57,22 @@ _stop_event = threading.Event()
 _codex_procs: dict[int, subprocess.Popen] = {}
 _codex_lock = threading.Lock()
 _csv_lock = threading.Lock()
+_drain_lock = threading.Lock()
+_idle_retry_done = False
 _worker_count = 1
 
+_ICIMS_SKIP_SQL = """
+                      AND LOWER(COALESCE(application_url, url)) NOT LIKE '%icims.com%'
+                      AND LOWER(url) NOT LIKE '%icims.com%'
+                      AND LOWER(COALESCE(application_url, url)) NOT LIKE '%icims=%'
+                      AND LOWER(url) NOT LIKE '%icims=%'
+"""
+
 PLAYWRIGHT_MCP_VERSION = "0.0.80"
-EXCLUDED_COMPANIES = ("google", "coinbase")
+# Company name is not an eligibility criterion; only explicit graduate-only
+# requirements are excluded by the queue predicates below.
+EXCLUDED_COMPANIES: tuple[str, ...] = ()
+_EXCLUDED_COMPANY_SQL = "''"
 PLAYWRIGHT_ENABLED_TOOLS = [
     "browser_navigate",
     "browser_navigate_back",
@@ -163,135 +177,222 @@ def acquire_job(target_url: str | None = None, min_score: int = 0,
         Job dict or None if the queue is empty.
     """
     conn = get_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        if not target_url and _worker_count > 1:
-            _assign_unassigned_batches(conn, _worker_count)
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not target_url and _worker_count > 1:
+                existing = conn.execute(
+                    """
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE apply_worker = ? AND apply_status = 'in_progress'
+                    LIMIT 1
+                    """,
+                    (worker_id,),
+                ).fetchone()
+                if existing:
+                    conn.rollback()
+                    job = dict(existing)
+                    job["tailored_resume_path"] = str(config.RESUME_PATH)
+                    return job
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND (apply_status IS NULL OR apply_status != 'in_progress')
-                  AND LOWER(TRIM(site)) NOT IN ('google', 'coinbase')
-                  AND LOWER(url) NOT LIKE '%master%'
-                  AND LOWER(url) NOT LIKE '%mba%'
-                  AND LOWER(url) NOT LIKE '%phd%'
-                  AND LOWER(url) NOT LIKE '%ph.d%'
-                  AND LOWER(url) NOT LIKE '%doctoral%'
-                  AND LOWER(url) NOT LIKE '%doctorate%'
-                  AND LOWER(url) NOT LIKE '%graduate-student%'
-                  AND LOWER(url) NOT LIKE '%graduate-intern%'
-                  AND LOWER(url) NOT LIKE '%graduate-level%'
-                  AND LOWER(url) NOT LIKE '%graduate-researcher%'
-                  AND LOWER(url) NOT LIKE '%graduate-apprentice%'
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            params: list = [config.DEFAULTS["max_apply_attempts"]]
-            worker_clause = ""
-            if _worker_count > 1:
-                worker_clause = "AND apply_worker = ?"
-                params.append(worker_id)
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND LOWER(TRIM(site)) NOT IN ('google', 'coinbase')
-                  AND LOWER(title) NOT LIKE '%master%'
-                  AND LOWER(title) NOT LIKE '%mba%'
-                  AND LOWER(title) NOT LIKE '%phd%'
-                  AND LOWER(title) NOT LIKE '%ph.d%'
-                  AND LOWER(title) NOT LIKE '%doctoral%'
-                  AND LOWER(title) NOT LIKE '%doctorate%'
-                  AND LOWER(title) NOT LIKE '%graduate student%'
-                  AND LOWER(title) NOT LIKE '%graduate intern%'
-                  AND LOWER(title) NOT LIKE '%graduate-level%'
-                  AND LOWER(title) NOT LIKE '%graduate level%'
-                  AND LOWER(title) NOT LIKE '%graduate researcher%'
-                  AND LOWER(title) NOT LIKE '%graduate apprentice%'
-                  AND LOWER(url) NOT LIKE '%master%'
-                  AND LOWER(url) NOT LIKE '%mba%'
-                  AND LOWER(url) NOT LIKE '%phd%'
-                  AND LOWER(url) NOT LIKE '%ph.d%'
-                  AND LOWER(url) NOT LIKE '%doctoral%'
-                  AND LOWER(url) NOT LIKE '%doctorate%'
-                  AND LOWER(url) NOT LIKE '%graduate-student%'
-                  AND LOWER(url) NOT LIKE '%graduate-intern%'
-                  AND LOWER(url) NOT LIKE '%graduate-level%'
-                  AND LOWER(url) NOT LIKE '%graduate-researcher%'
-                  AND LOWER(url) NOT LIKE '%graduate-apprentice%'
-                  {worker_clause}
-                  {site_clause}
-                  {url_clauses}
-                ORDER BY
-                  CASE WHEN apply_status = 'failed' THEN 0 ELSE 1 END,
-                  CASE
-                    WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 0
-                    WHEN COALESCE(application_url, url) LIKE '%workday%' THEN 1
-                    ELSE 2
-                  END,
-                  url
-                LIMIT 1
-            """, params).fetchone()
+            if target_url:
+                like = f"%{target_url.split('?')[0].rstrip('/')}%"
+                row = conn.execute(f"""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                      AND COALESCE(apply_status, '') NOT IN ('applied', 'in_progress')
+                      AND COALESCE(apply_error, '') NOT IN (
+                            'application_outcome_unknown', 'no_result_line',
+                            'captcha_submit_checkpoint'
+                      )
+                      AND LOWER(TRIM(site)) NOT IN ({_EXCLUDED_COMPANY_SQL})
+                      AND LOWER(REPLACE(url, 'mastercard', '')) NOT LIKE '%master%'
+                      AND LOWER(url) NOT LIKE '%mba%'
+                      AND LOWER(url) NOT LIKE '%phd%'
+                      AND LOWER(url) NOT LIKE '%ph.d%'
+                      AND LOWER(url) NOT LIKE '%doctoral%'
+                      AND LOWER(url) NOT LIKE '%doctorate%'
+                      AND LOWER(url) NOT LIKE '%graduate-student%'
+                      AND LOWER(REPLACE(LOWER(url), 'undergraduate', '')) NOT LIKE '%graduate-intern%'
+                      AND LOWER(url) NOT LIKE '%graduate-level%'
+                      AND LOWER(url) NOT LIKE '%graduate-researcher%'
+                      AND LOWER(url) NOT LIKE '%graduate-apprentice%'
+                    LIMIT 1
+                """, (target_url, target_url, like, like)).fetchone()
+            else:
+                blocked_sites, blocked_patterns = _load_blocked()
+                params: list = [config.DEFAULTS["max_apply_attempts"]]
+                # Shared global queue: every worker takes the next
+                # highest-priority job, same ordering as the solo worker.
+                busy_site_clause = ""
+                if _worker_count > 1:
+                    # Robinhood is allowed in parallel so leftover intern roles
+                    # can finish instead of waiting behind one Greenhouse tab.
+                    busy_site_clause = """
+                      AND (
+                        LOWER(TRIM(COALESCE(site, ''))) = 'robinhood'
+                        OR site IS NULL
+                        OR TRIM(site) = ''
+                        OR LOWER(TRIM(site)) NOT IN (
+                          SELECT LOWER(TRIM(j2.site)) FROM jobs j2
+                          WHERE j2.apply_status = 'in_progress'
+                            AND j2.site IS NOT NULL
+                            AND TRIM(j2.site) != ''
+                            AND LOWER(TRIM(j2.site)) != 'robinhood'
+                        )
+                      )
+                    """
+                site_clause = ""
+                if blocked_sites:
+                    blocked_lower = sorted({str(site).lower() for site in blocked_sites})
+                    placeholders = ",".join("?" * len(blocked_lower))
+                    site_clause = f"AND LOWER(TRIM(site)) NOT IN ({placeholders})"
+                    params.extend(blocked_lower)
+                url_clauses = ""
+                if blocked_patterns:
+                    url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                    params.extend(blocked_patterns)
+                from applypilot.apply import icims as icims_mod
+                host_clauses = ""
+                for host in icims_mod.blocked_hostnames():
+                    host_clauses += (
+                        " AND LOWER(COALESCE(application_url, url)) NOT LIKE ?"
+                        " AND LOWER(url) NOT LIKE ?"
+                    )
+                    params.extend([f"%{host}%", f"%{host}%"])
+                row = conn.execute(f"""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (apply_status IS NULL OR apply_status = 'failed')
+                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                      AND LOWER(TRIM(site)) NOT IN ({_EXCLUDED_COMPANY_SQL})
+                      AND LOWER(title) NOT LIKE '%master%'
+                      AND LOWER(title) NOT LIKE '%mba%'
+                      AND LOWER(title) NOT LIKE '%phd%'
+                      AND LOWER(title) NOT LIKE '%ph.d%'
+                      AND LOWER(title) NOT LIKE '%doctoral%'
+                      AND LOWER(title) NOT LIKE '%doctorate%'
+                      AND LOWER(title) NOT LIKE '%graduate student%'
+                      AND LOWER(REPLACE(LOWER(title), 'undergraduate', '')) NOT LIKE '%graduate intern%'
+                      AND LOWER(title) NOT LIKE '%graduate-level%'
+                      AND LOWER(title) NOT LIKE '%graduate level%'
+                      AND LOWER(title) NOT LIKE '%graduate researcher%'
+                      AND LOWER(title) NOT LIKE '%graduate apprentice%'
+                      AND LOWER(REPLACE(url, 'mastercard', '')) NOT LIKE '%master%'
+                      AND LOWER(url) NOT LIKE '%mba%'
+                      AND LOWER(url) NOT LIKE '%phd%'
+                      AND LOWER(url) NOT LIKE '%ph.d%'
+                      AND LOWER(url) NOT LIKE '%doctoral%'
+                      AND LOWER(url) NOT LIKE '%doctorate%'
+                      AND LOWER(url) NOT LIKE '%graduate-student%'
+                      AND LOWER(REPLACE(LOWER(url), 'undergraduate', '')) NOT LIKE '%graduate-intern%'
+                      AND LOWER(url) NOT LIKE '%graduate-level%'
+                      AND LOWER(url) NOT LIKE '%graduate-researcher%'
+                      AND LOWER(url) NOT LIKE '%graduate-apprentice%'
+                      {_ICIMS_SKIP_SQL}
+                      {busy_site_clause}
+                      {site_clause}
+                      {url_clauses}
+                      {host_clauses}
+                    ORDER BY
+                      CASE WHEN LOWER(TRIM(site)) = 'robinhood' THEN 0 ELSE 1 END,
+                      CASE
+                        WHEN (
+                            LOWER(COALESCE(application_url, url)) LIKE '%icims=%'
+                         OR LOWER(url) LIKE '%icims=%'
+                        ) AND LOWER(COALESCE(application_url, url)) NOT LIKE '%icims.com%' THEN 3
+                        WHEN COALESCE(strategy, '') = 'simplify-summer-2027'
+                         AND LOWER(TRIM(site)) != 'robinhood' THEN 2
+                        ELSE 1
+                      END,
+                      CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END,
+                      CASE
+                        WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 0
+                        WHEN COALESCE(application_url, url) LIKE '%workday%' THEN 1
+                        WHEN COALESCE(application_url, url) LIKE '%greenhouse%' THEN 2
+                        WHEN COALESCE(application_url, url) LIKE '%icims.com%' THEN 5
+                        WHEN COALESCE(application_url, url) LIKE '%icims=%' THEN 6
+                        WHEN COALESCE(application_url, url) LIKE '%lever.co%' THEN 4
+                        ELSE 3
+                      END,
+                      url
+                    LIMIT 1
+                """, params).fetchone()
 
-        if not row:
-            conn.rollback()
-            return None
+            if not row:
+                conn.rollback()
+                return None
 
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from applypilot.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
+            apply_url = row["application_url"] or row["url"]
+            if config.is_manual_ats(apply_url):
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                logger.info("Skipping manual ATS: %s", row["url"][:80])
+                if target_url:
+                    return None
+                continue
+
+            job = dict(row)
+            if not reserve:
+                conn.rollback()
+                # Always use the master resume — enrich/score/tailor stages are removed.
+                job["tailored_resume_path"] = str(config.RESUME_PATH)
+                return job
+
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = conn.execute("""
+                UPDATE jobs SET apply_status = 'in_progress',
+                               apply_worker = ?,
+                               agent_id = ?,
+                               last_attempted_at = ?,
+                               apply_error = NULL
+                WHERE url = ?
+                  AND (apply_status IS NULL OR apply_status = 'failed')
+            """, (worker_id, f"worker-{worker_id}", now, row["url"]))
+            if cursor.rowcount != 1:
+                conn.rollback()
+                if target_url:
+                    return None
+                continue
             conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
+            # Remove a previous failed export while this attempt is active.  The
+            # CSV is an issues/results export, so it must not retain stale rows.
+            _sync_applications_csv(conn)
 
-        job = dict(row)
-        if not reserve:
-            conn.rollback()
             # Always use the master resume — enrich/score/tailor stages are removed.
             job["tailored_resume_path"] = str(config.RESUME_PATH)
             return job
-
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?,
-                           apply_error = NULL
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
-        conn.commit()
-        # Remove a previous failed export while this attempt is active.  The
-        # CSV is an issues/results export, so it must not retain stale rows.
-        _sync_applications_csv(conn)
-
-        # Always use the master resume — enrich/score/tailor stages are removed.
-        job["tailored_resume_path"] = str(config.RESUME_PATH)
-        return job
-    except Exception:
-        conn.rollback()
-        raise
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            if _worker_count > 1:
+                existing = conn.execute(
+                    """
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE apply_worker = ? AND apply_status = 'in_progress'
+                    LIMIT 1
+                    """,
+                    (worker_id,),
+                ).fetchone()
+                if existing:
+                    job = dict(existing)
+                    job["tailored_resume_path"] = str(config.RESUME_PATH)
+                    return job
+            if target_url:
+                return None
+            continue
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def assign_worker_batches(worker_count: int) -> int:
@@ -345,6 +446,51 @@ def _assign_unassigned_batches(conn, worker_count: int) -> int:
         )
         counts[worker] += 1
     return len(rows)
+
+
+def rebalance_worker_batches(worker_count: int) -> int:
+    """Evenly split remaining eligible jobs across workers without stealing in-progress ones."""
+    if worker_count < 1:
+        raise ValueError("worker_count must be positive")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        counts = {worker: 0 for worker in range(worker_count)}
+        for worker, count in conn.execute(
+            """
+            SELECT apply_worker, COUNT(*)
+            FROM jobs
+            WHERE apply_status = 'in_progress' AND apply_worker IS NOT NULL
+            GROUP BY apply_worker
+            """
+        ):
+            if worker in counts:
+                counts[worker] = count
+        rows = conn.execute(
+            """
+            SELECT url
+            FROM jobs
+            WHERE apply_status IS NULL
+               OR (apply_status = 'failed'
+                   AND (apply_attempts IS NULL OR apply_attempts < ?))
+            ORDER BY url
+            """,
+            (config.DEFAULTS["max_apply_attempts"],),
+        ).fetchall()
+        moved = 0
+        for row in rows:
+            worker = min(counts, key=lambda candidate: (counts[candidate], candidate))
+            conn.execute(
+                "UPDATE jobs SET apply_worker = ? WHERE url = ?",
+                (worker, row["url"]),
+            )
+            counts[worker] += 1
+            moved += 1
+        conn.commit()
+        return moved
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -412,6 +558,13 @@ def _sync_applications_csv(conn=None) -> None:
         with _csv_lock:
             for destination in destinations:
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                # A concurrent/stale SQLite connection can transiently return
+                # no terminal rows while another worker still has the real
+                # queue state. Never destroy a populated export in that case.
+                if not rows and destination.exists():
+                    with destination.open(newline="", encoding="utf-8") as existing:
+                        if next(csv.DictReader(existing), None) is not None:
+                            continue
                 # Replace atomically so readers never observe a truncated export
                 # while the live worker is syncing results.
                 with tempfile.NamedTemporaryFile(
@@ -444,21 +597,62 @@ def _send_notification(message: str) -> None:
     del message
 
 
-def _wait_for_captcha_resolution(job: dict, worker_id: int) -> bool:
-    """Pause a worker until the user marks its visible CAPTCHA as solved."""
+def _wait_for_captcha_resolution(job: dict, worker_id: int,
+                                 timeout: float | None = None) -> bool:
+    """Wait for a visible CAPTCHA to clear, with a bounded unattended timeout."""
     marker = config.APP_DIR / f"captcha-worker-{worker_id}.resolved"
+    if timeout is None:
+        timeout = float(config.DEFAULTS.get("captcha_headed_wait_seconds") or 90)
     _send_notification(
         f"CAPTCHA needs you: {job.get('title', 'job')} at {job.get('site', 'employer')}. "
         "Solve it in the open Chrome window, then reply 'done' in Codex."
     )
-    add_event(f"[W{worker_id}] CAPTCHA waiting for user; browser left open")
-    update_state(worker_id, status="captcha", last_action="waiting for user")
+    add_event(f"[W{worker_id}] CAPTCHA waiting up to {int(timeout)}s for extension/user")
+    update_state(worker_id, status="captcha", last_action="waiting for captcha")
+    deadline = time.time() + timeout
     while not _stop_event.wait(timeout=2):
         if marker.exists():
             marker.unlink(missing_ok=True)
             add_event(f"[W{worker_id}] CAPTCHA marked solved; resuming")
             return True
+        if time.time() >= deadline:
+            add_event(f"[W{worker_id}] CAPTCHA wait timed out after {int(timeout)}s")
+            return False
     return False
+
+
+def _hostname(url: str | None) -> str:
+    """Return a lowercase hostname, or empty if the URL has none."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if host in {"localhost", "127.0.0.1"}:
+        return ""
+    return host
+
+
+def _negative_cache_captcha_host(source_url: str, error: str) -> int:
+    """Permanently skip other pending jobs on the same hostname."""
+    host = _hostname(source_url)
+    if not host:
+        return 0
+    like = f"%{host}%"
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        UPDATE jobs
+           SET apply_status = 'failed',
+               apply_error = ?,
+               apply_attempts = 99,
+               agent_id = NULL
+         WHERE COALESCE(apply_status, '') NOT IN ('applied', 'in_progress')
+           AND url != ?
+           AND (url LIKE ? OR COALESCE(application_url, '') LIKE ?)
+        """,
+        (error, source_url, like, like),
+    )
+    conn.commit()
+    if cursor.rowcount:
+        _sync_applications_csv(conn)
+    return cursor.rowcount
 
 
 def _resolve_captcha(
@@ -467,27 +661,56 @@ def _resolve_captcha(
     port: int,
     *,
     allow_manual_wait: bool = True,
-) -> bool:
-    """Try CapSolver, optionally falling back to a visible manual wait."""
-    from applypilot.apply.capsolver import is_enabled, try_solve_on_cdp
+):
+    """Pause Luna, try the configured provider on this same Chrome session.
 
-    if is_enabled():
-        update_state(worker_id, status="captcha", last_action="CapSolver solving")
-        add_event(f"[W{worker_id}] CapSolver attempting to solve CAPTCHA")
-        try:
-            if try_solve_on_cdp(port):
-                add_event(f"[W{worker_id}] CapSolver solved CAPTCHA")
-                return True
-        except Exception:
-            logger.exception("CapSolver auto-solve failed")
-        if not allow_manual_wait:
-            add_event(f"[W{worker_id}] CapSolver could not auto-solve in headless mode")
-            return False
-        add_event(f"[W{worker_id}] CapSolver could not auto-solve; waiting for user")
-    elif not allow_manual_wait:
-        add_event(f"[W{worker_id}] CAPTCHA cannot be solved in headless mode")
-        return False
-    return _wait_for_captcha_resolution(job, worker_id)
+    hCaptcha uses NopeCHA. Other CAPTCHAs use CapSolver. Returns a
+    CaptchaResolution that unpacks as (solved, unsupported).
+    """
+    from applypilot.apply.captcha import resolve_live_captcha
+
+    return resolve_live_captcha(
+        port,
+        worker_id=worker_id,
+        allow_manual_wait=allow_manual_wait,
+        wait_fn=(lambda: _wait_for_captcha_resolution(job, worker_id)) if allow_manual_wait else None,
+        add_event=add_event,
+        update_state=update_state,
+    )
+
+
+def _try_icims_network_reroute(
+    job: dict,
+    worker_id: int,
+    port: int,
+    model: str,
+) -> tuple[str, int] | None:
+    """If hCaptcha blocked iCIMS, try an official Apply Network mirror once."""
+    from applypilot.apply import icims as icims_mod
+
+    if not icims_mod.is_icims_job(job):
+        return None
+    add_event(f"[W{worker_id}] iCIMS hCaptcha; searching Apply Network mirror")
+    try:
+        mirror = icims_mod.maybe_apply_network_url(job)
+    except Exception:
+        logger.exception("Apply Network search failed")
+        mirror = None
+    host = icims_mod.listing_hostname(job.get("application_url") or job.get("url") or "")
+    if not mirror:
+        icims_mod.record_host_policy(host, icims_mod.POLICY_BLOCK, "live_hcaptcha")
+        return None
+    add_event(f"[W{worker_id}] Apply Network mirror {mirror[:80]}")
+    job["application_url"] = mirror
+    job["apply_route"] = icims_mod.ROUTE_APPLY_NETWORK
+    conn = get_connection()
+    conn.execute(
+        "UPDATE jobs SET application_url = ?, apply_route = ? WHERE url = ?",
+        (mirror, icims_mod.ROUTE_APPLY_NETWORK, job["url"]),
+    )
+    conn.commit()
+    icims_mod.record_host_policy(host, icims_mod.POLICY_BLOCK, "live_hcaptcha_rerouted")
+    return run_job(job, port=port, worker_id=worker_id, model=model, dry_run=False)
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +795,317 @@ def reset_failed() -> int:
     """)
     conn.commit()
     return cursor.rowcount
+
+
+def close_ineligible_jobs() -> int:
+    """Mark leftover graduate and blocked rows so workers stop polling them."""
+    conn = get_connection()
+    blocked_sites, blocked_patterns = _load_blocked()
+    closed = 0
+    cursor = conn.execute("""
+        UPDATE jobs
+           SET apply_status = 'failed',
+               apply_error = 'job_requires_grad_school',
+               apply_attempts = 99,
+               agent_id = NULL
+         WHERE apply_status IS NULL
+           AND (
+                LOWER(title) LIKE '%master%'
+             OR LOWER(title) LIKE '%mba%'
+             OR LOWER(title) LIKE '%phd%'
+             OR LOWER(title) LIKE '%ph.d%'
+             OR LOWER(title) LIKE '%doctoral%'
+             OR LOWER(title) LIKE '%doctorate%'
+             OR LOWER(title) LIKE '%graduate student%'
+             OR LOWER(REPLACE(LOWER(title), 'undergraduate', '')) LIKE '%graduate intern%'
+             OR LOWER(title) LIKE '%graduate-level%'
+             OR LOWER(title) LIKE '%graduate level%'
+             OR LOWER(title) LIKE '%graduate researcher%'
+             OR LOWER(title) LIKE '%graduate apprentice%'
+             OR LOWER(REPLACE(url, 'mastercard', '')) LIKE '%master%'
+             OR LOWER(url) LIKE '%mba%'
+             OR LOWER(url) LIKE '%phd%'
+             OR LOWER(url) LIKE '%ph.d%'
+             OR LOWER(url) LIKE '%doctoral%'
+             OR LOWER(url) LIKE '%doctorate%'
+             OR LOWER(url) LIKE '%graduate-student%'
+             OR LOWER(REPLACE(LOWER(url), 'undergraduate', '')) LIKE '%graduate-intern%'
+             OR LOWER(url) LIKE '%graduate-level%'
+             OR LOWER(url) LIKE '%graduate-researcher%'
+             OR LOWER(url) LIKE '%graduate-apprentice%'
+           )
+    """)
+    closed += cursor.rowcount
+    from applypilot.apply import icims as icims_mod
+    icims_mod.seed_policy_from_jobs(conn)
+    synced = icims_mod.sync_jobs_to_host_policy(conn)
+    if synced.get("unheld") or synced.get("parked"):
+        logger.info(
+            "iCIMS host policy parked=%d unheld=%d",
+            synced.get("parked", 0), synced.get("unheld", 0),
+        )
+    cursor = conn.execute("""
+        UPDATE jobs
+           SET apply_status = 'failed',
+               apply_error = 'icims_unsupported',
+               apply_attempts = 99,
+               agent_id = NULL
+         WHERE COALESCE(apply_status, '') NOT IN ('applied', 'in_progress')
+           AND (
+                LOWER(COALESCE(application_url, url)) LIKE '%icims.com%'
+             OR LOWER(url) LIKE '%icims.com%'
+             OR LOWER(COALESCE(application_url, url)) LIKE '%icims=%'
+             OR LOWER(url) LIKE '%icims=%'
+           )
+    """)
+    closed += cursor.rowcount
+    cursor = conn.execute(f"""
+        UPDATE jobs
+           SET apply_status = 'failed',
+               apply_error = 'site_blocked',
+               apply_attempts = 99,
+               agent_id = NULL
+         WHERE COALESCE(apply_status, '') NOT IN ('applied', 'in_progress')
+           AND (
+                LOWER(TRIM(site)) IN ({_EXCLUDED_COMPANY_SQL})
+             OR LOWER(COALESCE(application_url, url)) LIKE '%lifeattiktok.com%'
+             OR LOWER(url) LIKE '%lifeattiktok.com%'
+             OR LOWER(COALESCE(application_url, url)) LIKE '%careers.tiktok.com%'
+             OR LOWER(url) LIKE '%careers.tiktok.com%'
+           )
+    """)
+    closed += cursor.rowcount
+    if blocked_sites:
+        placeholders = ",".join("?" * len(blocked_sites))
+        cursor = conn.execute(
+            f"""
+            UPDATE jobs
+               SET apply_status = 'failed',
+                   apply_error = 'site_blocked',
+                   apply_attempts = 99,
+                   agent_id = NULL
+             WHERE apply_status IS NULL
+               AND LOWER(TRIM(site)) IN ({placeholders})
+            """,
+            tuple(str(site).lower() for site in blocked_sites),
+        )
+        closed += cursor.rowcount
+    for pattern in blocked_patterns:
+        cursor = conn.execute(
+            """
+            UPDATE jobs
+               SET apply_status = 'failed',
+                   apply_error = 'site_blocked',
+                   apply_attempts = 99,
+                   agent_id = NULL
+             WHERE apply_status IS NULL
+               AND url LIKE ?
+            """,
+            (pattern,),
+        )
+        closed += cursor.rowcount
+    conn.commit()
+    _sync_applications_csv(conn)
+    return closed
+
+
+def reset_retryable_failures() -> int:
+    """Put failed jobs back at the end of each worker's owned queue.
+
+    Keeps apply_status='failed' and apply_worker so workers finish fresh
+    pending jobs first, then retry their own failures without reshuffling.
+    Graduate and blocked-site rows stay closed.
+    """
+    conn = get_connection()
+    blocked_sites, blocked_patterns = _load_blocked()
+    max_attempts = config.DEFAULTS["max_apply_attempts"]
+    sql = f"""
+        UPDATE jobs
+           SET apply_attempts = 0,
+               agent_id = NULL
+         WHERE apply_status = 'failed'
+           AND apply_attempts IS NOT NULL
+           AND apply_attempts > 0
+           AND apply_attempts < ?
+           AND LOWER(TRIM(site)) NOT IN ({_EXCLUDED_COMPANY_SQL})
+           AND LOWER(title) NOT LIKE '%master%'
+           AND LOWER(title) NOT LIKE '%mba%'
+           AND LOWER(title) NOT LIKE '%phd%'
+           AND LOWER(title) NOT LIKE '%ph.d%'
+           AND LOWER(title) NOT LIKE '%doctoral%'
+           AND LOWER(title) NOT LIKE '%doctorate%'
+           AND LOWER(title) NOT LIKE '%graduate student%'
+           AND LOWER(REPLACE(LOWER(title), 'undergraduate', '')) NOT LIKE '%graduate intern%'
+           AND LOWER(title) NOT LIKE '%graduate-level%'
+           AND LOWER(title) NOT LIKE '%graduate level%'
+           AND LOWER(title) NOT LIKE '%graduate researcher%'
+           AND LOWER(title) NOT LIKE '%graduate apprentice%'
+           AND LOWER(REPLACE(url, 'mastercard', '')) NOT LIKE '%master%'
+           AND LOWER(url) NOT LIKE '%mba%'
+           AND LOWER(url) NOT LIKE '%phd%'
+           AND LOWER(url) NOT LIKE '%ph.d%'
+           AND LOWER(url) NOT LIKE '%doctoral%'
+           AND LOWER(url) NOT LIKE '%doctorate%'
+           AND LOWER(url) NOT LIKE '%graduate-student%'
+           AND LOWER(REPLACE(LOWER(url), 'undergraduate', '')) NOT LIKE '%graduate-intern%'
+           AND LOWER(url) NOT LIKE '%graduate-level%'
+           AND LOWER(url) NOT LIKE '%graduate-researcher%'
+           AND LOWER(url) NOT LIKE '%graduate-apprentice%'
+           AND COALESCE(apply_error, '') NOT IN (
+               'job_requires_grad_school', 'job_requires_PhD',
+               'job_requires_masters', 'job_requires_MBA',
+               'job_requires_doctorate', 'site_blocked',
+               'icims_unsupported', 'icims_lab_hold', 'icims_blocked_hcaptcha',
+               'expired', 'login_issue', 'already_applied', 'captcha',
+               'manual_question', 'account_required', 'sso_required'
+           )
+           AND COALESCE(apply_error, '') NOT LIKE 'captcha%'
+           AND COALESCE(apply_error, '') NOT LIKE 'hcaptcha%'
+           AND COALESCE(apply_error, '') NOT LIKE 'possible_spam%'
+           AND LOWER(COALESCE(application_url, url)) NOT LIKE '%icims.com%'
+           AND LOWER(url) NOT LIKE '%icims.com%'
+           AND LOWER(COALESCE(application_url, url)) NOT LIKE '%icims=%'
+           AND LOWER(url) NOT LIKE '%icims=%'
+    """
+    params: list = [max_attempts]
+    if blocked_sites:
+        blocked_lower = sorted({str(site).lower() for site in blocked_sites})
+        placeholders = ",".join("?" * len(blocked_lower))
+        sql += f" AND LOWER(TRIM(site)) NOT IN ({placeholders})"
+        params.extend(blocked_lower)
+    for pattern in blocked_patterns:
+        sql += " AND url NOT LIKE ?"
+        params.append(pattern)
+    cursor = conn.execute(sql, params)
+    conn.commit()
+    _sync_applications_csv(conn)
+    return cursor.rowcount
+
+
+def requeue_unfinished_non_icims() -> int:
+    """Reset leftover failed non-iCIMS jobs for one more full apply pass.
+
+    Leaves iCIMS, excluded companies, graduate roles, already-applied rows,
+    site blocks, and arbitration/SSN holds parked.
+    """
+    conn = get_connection()
+    blocked_sites, blocked_patterns = _load_blocked()
+    sql = f"""
+        UPDATE jobs
+           SET apply_attempts = 0,
+               apply_worker = NULL,
+               agent_id = NULL
+         WHERE apply_status = 'failed'
+           AND LOWER(TRIM(site)) NOT IN ({_EXCLUDED_COMPANY_SQL})
+           AND LOWER(title) NOT LIKE '%master%'
+           AND LOWER(title) NOT LIKE '%mba%'
+           AND LOWER(title) NOT LIKE '%phd%'
+           AND LOWER(title) NOT LIKE '%ph.d%'
+           AND LOWER(title) NOT LIKE '%doctoral%'
+           AND LOWER(title) NOT LIKE '%doctorate%'
+           {_ICIMS_SKIP_SQL}
+           AND COALESCE(apply_error, '') NOT IN (
+               'job_requires_grad_school', 'job_requires_PhD',
+               'job_requires_masters', 'job_requires_MBA',
+               'job_requires_doctorate', 'site_blocked',
+               'icims_unsupported', 'icims_lab_hold', 'icims_blocked_hcaptcha',
+               'already_applied', 'uk_work_authorization_required',
+               'role_requires_masters_degree'
+           )
+           AND COALESCE(apply_error, '') NOT LIKE 'job_requires_%'
+           AND COALESCE(apply_error, '') NOT LIKE '%arbitration%'
+           AND COALESCE(apply_error, '') NOT LIKE '%Arbitrate%'
+           AND COALESCE(apply_error, '') NOT LIKE '%SSN%'
+           AND COALESCE(apply_error, '') NOT LIKE '%Social Security%'
+           AND COALESCE(apply_error, '') NOT LIKE '%Social Insurance%'
+           AND COALESCE(apply_error, '') NOT LIKE '%WOTC%'
+           AND COALESCE(apply_error, '') NOT LIKE 'maximum_application%'
+    """
+    params: list = []
+    if blocked_sites:
+        blocked_lower = sorted({str(site).lower() for site in blocked_sites})
+        placeholders = ",".join("?" * len(blocked_lower))
+        sql += f" AND LOWER(TRIM(site)) NOT IN ({placeholders})"
+        params.extend(blocked_lower)
+    for pattern in blocked_patterns:
+        sql += " AND url NOT LIKE ?"
+        params.append(pattern)
+    cursor = conn.execute(sql, params)
+    conn.commit()
+    _sync_applications_csv(conn)
+    return cursor.rowcount
+
+
+def in_progress_count() -> int:
+    conn = get_connection()
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'in_progress'"
+    ).fetchone()[0])
+
+
+def eligible_apply_count() -> int:
+    """Pending or retryable-failed jobs the live fleet may still claim."""
+    conn = get_connection()
+    blocked_sites, blocked_patterns = _load_blocked()
+    params: list = [config.DEFAULTS["max_apply_attempts"]]
+    site_clause = ""
+    if blocked_sites:
+        blocked_lower = sorted({str(site).lower() for site in blocked_sites})
+        placeholders = ",".join("?" * len(blocked_lower))
+        site_clause = f"AND LOWER(TRIM(site)) NOT IN ({placeholders})"
+        params.extend(blocked_lower)
+    url_clauses = ""
+    if blocked_patterns:
+        url_clauses = " ".join(
+            "AND LOWER(url) NOT LIKE ? AND LOWER(COALESCE(application_url, url)) NOT LIKE ?"
+            for _ in blocked_patterns
+        )
+        for pattern in blocked_patterns:
+            params.extend([pattern, pattern])
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM jobs
+         WHERE (apply_status IS NULL OR apply_status = 'failed')
+           AND (apply_attempts IS NULL OR apply_attempts < ?)
+           AND LOWER(TRIM(site)) NOT IN ({_EXCLUDED_COMPANY_SQL})
+           AND LOWER(title) NOT LIKE '%master%'
+           AND LOWER(title) NOT LIKE '%mba%'
+           AND LOWER(title) NOT LIKE '%phd%'
+           AND LOWER(title) NOT LIKE '%ph.d%'
+           AND LOWER(title) NOT LIKE '%doctoral%'
+           AND LOWER(title) NOT LIKE '%doctorate%'
+           {_ICIMS_SKIP_SQL}
+           {site_clause}
+           {url_clauses}
+        """,
+        params,
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def fleet_has_apply_work() -> bool:
+    return in_progress_count() > 0 or eligible_apply_count() > 0
+
+
+def drain_idle_queue() -> str:
+    """Decide what an idle continuous worker should do.
+
+    Returns:
+        work: claimable rows remain or other workers are still in progress
+        retrying: requeued retryable failures; acquire again immediately
+        stop: nothing left after one reload pass
+    """
+    global _idle_retry_done
+    with _drain_lock:
+        if in_progress_count() > 0 or eligible_apply_count() > 0:
+            return "work"
+        if not _idle_retry_done:
+            _idle_retry_done = True
+            requeued = reset_retryable_failures()
+            if requeued:
+                logger.info("Requeued %d retryable failures before drain", requeued)
+                return "retrying"
+        return "stop"
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +1307,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
-    "not_eligible_location", "not_eligible_salary",
+    "not_eligible_location", "not_eligible_salary", "no_base_pay",
     "job_requires_PhD", "job_requires_masters", "job_requires_MBA",
     "job_requires_doctorate", "job_requires_grad_school",
     "manual_question",
@@ -784,9 +1318,21 @@ PERMANENT_FAILURES: set[str] = {
     "workday_unavailable", "workday_maintenance", "site_unavailable",
     "captcha_token_not_accepted",
     "hcaptcha_blocked",
+    "icims_lab_hold",
+    "icims_unsupported",
+    "icims_blocked_hcaptcha",
+    "captcha_provider_not_loaded",
+    "captcha_provider_unsupported",
+    "captcha_provider_timeout",
+    "captcha_completed_but_login_rejected",
+    "application_outcome_unknown",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by", "manual_question", "hcaptcha", "cookie_banner")
+PERMANENT_PREFIXES: tuple[str, ...] = (
+    "site_blocked", "cloudflare", "blocked_by", "manual_question",
+    "hcaptcha", "cookie_banner", "captcha_unsupported", "icims_lab",
+    "captcha_provider", "captcha_completed", "application_outcome",
+)
 
 
 def _is_permanent_failure(result: str) -> bool:
@@ -799,6 +1345,38 @@ def _is_permanent_failure(result: str) -> bool:
     )
 
 
+def _should_recycle_chrome(result: str, worker_id: int = 0) -> bool:
+    """Restart a worker browser after session-level failures.
+
+    Campaign workers 50-89 reuse the same minimized Chrome. Killing it after
+    every blocked click spawned a new window on screen.
+    """
+    reason = result.split(":", 1)[-1] if ":" in result else result
+    if 50 <= worker_id <= 89:
+        return reason in {
+            "browser_unavailable",
+            "browser_transport_closed",
+            "browser_server_unavailable",
+            "browser_session_unavailable",
+            "agent_startup_failed",
+        }
+    if reason.startswith("captcha"):
+        return True
+    return reason in {
+        "timeout",
+        "agent_startup_failed",
+        "browser_unavailable",
+        "browser_transport_closed",
+        "browser_server_unavailable",
+        "browser_session_unavailable",
+        "browser_interaction_blocked",
+        "403_forbidden",
+        "site_access_403",
+        "job_page_403",
+        "employer_site_403",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Worker loop
 # ---------------------------------------------------------------------------
@@ -806,7 +1384,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "gpt-5.6-luna", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "gpt-5.6-luna", dry_run: bool = False,
+                url_queue=None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -817,6 +1396,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         headless: Run Chrome headless.
         model: Codex model name.
         dry_run: Don't click Submit.
+        url_queue: Optional queue of URLs. Isolated iCIMS workers use this
+            instead of the live shared queue.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -827,109 +1408,282 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
-    if worker_id and _stop_event.wait(timeout=worker_id * 3):
+    chrome_proc = None
+    if worker_id and worker_id < _worker_count and _stop_event.wait(timeout=worker_id * 3):
         return applied, failed
 
-    while not _stop_event.is_set():
-        if not continuous and jobs_done >= limit:
-            break
-
-        update_state(worker_id, status="idle", job_title="", company="",
-                     last_action="waiting for job", actions=0)
-
-        job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id, reserve=not dry_run)
-        if not job:
-            if not continuous:
-                add_event(f"[W{worker_id}] Queue empty")
-                update_state(worker_id, status="done", last_action="queue empty")
+    try:
+        while not _stop_event.is_set():
+            if not continuous and jobs_done >= limit:
                 break
-            empty_polls += 1
-            update_state(worker_id, status="idle",
-                         last_action=f"polling ({empty_polls})")
-            if empty_polls == 1:
-                add_event(f"[W{worker_id}] Queue empty, polling every {POLL_INTERVAL}s...")
-            # Use Event.wait for interruptible sleep
-            if _stop_event.wait(timeout=POLL_INTERVAL):
-                break  # Stop was requested during wait
-            continue
 
-        empty_polls = 0
+            update_state(worker_id, status="idle", job_title="", company="",
+                         last_action="waiting for job", actions=0)
 
-        chrome_proc = None
-        try:
-            add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
-
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
-
-            captcha_rounds = 0
-            while result == "captcha" and not dry_run:
-                if captcha_rounds >= 2:
-                    add_event(f"[W{worker_id}] CAPTCHA loop limit; marking failed")
-                    result = "failed:captcha"
+            try:
+                next_url = target_url
+                if url_queue is not None:
+                    try:
+                        next_url = url_queue.get_nowait()
+                    except Exception as exc:
+                        from queue import Empty
+                        if not isinstance(exc, Empty):
+                            raise
+                        add_event(f"[W{worker_id}] Isolated queue empty")
+                        update_state(worker_id, status="done", last_action="queue empty")
+                        break
+                job = acquire_job(target_url=next_url, min_score=min_score,
+                                  worker_id=worker_id, reserve=not dry_run)
+            except Exception:
+                logger.exception("Worker %d failed to acquire a job", worker_id)
+                if _stop_event.wait(timeout=POLL_INTERVAL):
                     break
-                if not _resolve_captcha(
-                    job, worker_id, port, allow_manual_wait=not headless
-                ):
-                    result = "failed:captcha_unsolved"
+                continue
+            if not job:
+                if url_queue is not None:
+                    continue
+                if not continuous:
+                    add_event(f"[W{worker_id}] Queue empty")
+                    update_state(worker_id, status="done", last_action="queue empty")
                     break
-                captcha_rounds += 1
-                resumed_result, resumed_ms = run_job(
-                    job, port=port, worker_id=worker_id,
-                    model=model, dry_run=False, resume_current_page=True,
-                )
-                result = resumed_result
-                duration_ms += resumed_ms
-
-            if dry_run:
-                add_event(
-                    f"[W{worker_id}] Dry run finished: {job['title'][:40]}"
-                )
-                jobs_done += 1
-                if target_url:
+                action = drain_idle_queue()
+                if action == "retrying":
+                    add_event(f"[W{worker_id}] Reloaded retryable failures")
+                    continue
+                if action == "stop":
+                    add_event(f"[W{worker_id}] Queue drained; stopping workers")
+                    update_state(worker_id, status="done", last_action="queue drained")
+                    _stop_event.set()
+                    break
+                empty_polls += 1
+                update_state(worker_id, status="idle",
+                             last_action=f"polling ({empty_polls})")
+                if empty_polls == 1:
+                    add_event(f"[W{worker_id}] Waiting on in-progress jobs...")
+                if _stop_event.wait(timeout=POLL_INTERVAL):
                     break
                 continue
 
-            if result == "skipped":
+            empty_polls = 0
+            recycle_chrome = False
+            is_campaign = 50 <= worker_id <= 89
+            try:
+                if chrome_proc is None or chrome_proc.poll() is not None:
+                    add_event(f"[W{worker_id}] Launching Chrome...")
+                    chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+                else:
+                    cleanup_browser_tabs(
+                        port, keep_pages=1, park=is_campaign,
+                    )
+
+                result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+                                                model=model, dry_run=dry_run)
+
+                from applypilot.apply.captcha import (
+                    CHECKPOINT_ATTEMPT_COMPLETED,
+                    CHECKPOINT_NOT_LOADED,
+                    CHECKPOINT_TIMEOUT,
+                    CHECKPOINT_UNKNOWN,
+                    infer_funnel_checkpoint,
+                    provider_config_id,
+                )
+                from applypilot.apply.experiment import persist_trial, trial_from_job
+                from applypilot.apply import icims as icims_mod
+
+                trial = trial_from_job(job, worker_id=worker_id)
+                trial_started = time.time()
+                provider_solved = False
+                captcha_rounds = 0
+                allow_manual = (not headless) and worker_id < icims_mod.LAB_WORKER_ID
+                while result == "captcha" and not dry_run:
+                    if captcha_rounds >= 3:
+                        add_event(f"[W{worker_id}] CAPTCHA loop limit; marking failed")
+                        result = "failed:captcha"
+                        break
+                    resolution = _resolve_captcha(
+                        job, worker_id, port, allow_manual_wait=allow_manual
+                    )
+                    if not hasattr(resolution, "checkpoint"):
+                        solved, unsupported = resolution
+                        from applypilot.apply.captcha import CaptchaResolution as _CR
+                        resolution = _CR(
+                            solved=bool(solved),
+                            unsupported=unsupported,
+                            provider="none" if unsupported else "capsolver",
+                            checkpoint=(
+                                CHECKPOINT_TIMEOUT if not solved and not unsupported
+                                else (f"captcha_unsupported:{unsupported}" if unsupported else CHECKPOINT_ATTEMPT_COMPLETED)
+                            ),
+                            captcha_type=unsupported,
+                        )
+                        if not solved and not unsupported:
+                            resolution.checkpoint = "captcha_unsolved"
+                    trial.captcha_provider = resolution.provider
+                    trial.captcha_type = resolution.captcha_type or trial.captcha_type
+                    trial.provider_result = resolution.checkpoint
+                    trial.time_to_checkpoint = resolution.elapsed_ms
+                    trial.captcha_checkpoint = resolution.checkpoint
+                    if resolution.unsupported and not resolution.solved:
+                        rerouted = _try_icims_network_reroute(
+                            job, worker_id, port, model,
+                        )
+                        if rerouted:
+                            result, extra_ms = rerouted
+                            duration_ms += extra_ms
+                            trial.route_used = icims_mod.ROUTE_APPLY_NETWORK
+                            break
+                        result = f"failed:captcha_unsupported:{resolution.unsupported}"
+                        break
+                    if resolution.checkpoint == CHECKPOINT_TIMEOUT:
+                        result = f"failed:{CHECKPOINT_TIMEOUT}"
+                        break
+                    if resolution.checkpoint == CHECKPOINT_NOT_LOADED and not resolution.solved:
+                        result = f"failed:{CHECKPOINT_NOT_LOADED}"
+                        break
+                    if not resolution.solved:
+                        result = f"failed:{resolution.checkpoint or 'captcha_unsolved'}"
+                        break
+                    provider_solved = True
+                    captcha_rounds += 1
+                    resumed_result, resumed_ms = run_job(
+                        job, port=port, worker_id=worker_id,
+                        model=model, dry_run=False, resume_current_page=True,
+                    )
+                    result = resumed_result
+                    duration_ms += resumed_ms
+                    signals = icims_mod.inspect_page_signals(port)
+                    if signals:
+                        trial.final_host = icims_mod.listing_hostname(
+                            str(signals.get("url") or "")
+                        )
+                    trial.captcha_checkpoint = infer_funnel_checkpoint(
+                        result, signals, provider_solved=provider_solved,
+                    )
+                    if trial.captcha_checkpoint == "captcha_login_accepted":
+                        trial.login_result = "accepted"
+                    elif trial.captcha_checkpoint == "captcha_completed_but_login_rejected":
+                        trial.login_result = "rejected"
+                    if trial.captcha_checkpoint == "captcha_profile_checkpoint":
+                        trial.profile_result = "reached"
+                    if trial.captcha_checkpoint == "captcha_submit_checkpoint":
+                        trial.submit_result = "checkpoint"
+                    if result == "applied":
+                        trial.confirmation_detected = True
+                        trial.submit_result = "confirmed"
+
+                if worker_id >= icims_mod.LAB_WORKER_ID or icims_mod.is_icims_job(job):
+                    if result == "applied":
+                        trial.confirmation_detected = True
+                        trial.captcha_checkpoint = "application_confirmed"
+                        trial.submit_result = "confirmed"
+                    elif result == "login_issue" and provider_solved:
+                        result = "failed:captcha_completed_but_login_rejected"
+                        trial.login_result = "rejected"
+                        trial.captcha_checkpoint = "captcha_completed_but_login_rejected"
+                    elif result in {"failed:no_result_line", "failed:timeout"} and provider_solved:
+                        result = f"failed:{CHECKPOINT_UNKNOWN}"
+                        trial.captcha_checkpoint = CHECKPOINT_UNKNOWN
+                    trial.apply_status = "applied" if result == "applied" else "failed"
+                    trial.total_runtime = int((time.time() - trial_started) * 1000) + duration_ms
+                    trial.finished_at = datetime.now(timezone.utc).isoformat()
+                    if not trial.final_host:
+                        trial.final_host = icims_mod.listing_hostname(
+                            job.get("application_url") or job.get("url") or ""
+                        )
+                    try:
+                        persist_trial(get_connection(), trial)
+                    except Exception:
+                        logger.exception("Could not persist apply trial")
+
+                if dry_run:
+                    add_event(
+                        f"[W{worker_id}] Dry run finished: {job['title'][:40]}"
+                    )
+                    jobs_done += 1
+                    if target_url and url_queue is None:
+                        break
+                    continue
+
+                if result == "skipped":
+                    release_lock(job["url"])
+                    add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
+                    continue
+                elif result == "applied":
+                    mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    applied += 1
+                    update_state(worker_id, jobs_applied=applied,
+                                 jobs_done=applied + failed)
+                else:
+                    reason = result.split(":", 1)[-1] if ":" in result else result
+                    mark_result(job["url"], "failed", reason,
+                                permanent=_is_permanent_failure(result),
+                                duration_ms=duration_ms)
+                    if worker_id < icims_mod.LAB_WORKER_ID and (
+                        reason.startswith("captcha_unsupported")
+                        or reason in {
+                            "captcha_provider_timeout",
+                            "captcha_provider_unsupported",
+                            "captcha_provider_not_loaded",
+                        }
+                    ):
+                        from applypilot.apply import icims as icims_mod
+                        from applypilot.apply.captcha import provider_config_id
+                        icims_mod.record_host_policy(
+                            icims_mod.listing_hostname(
+                                job.get("application_url") or job["url"]
+                            ),
+                            icims_mod.POLICY_BLOCK,
+                            reason,
+                            provider_config=provider_config_id(),
+                        )
+                        if reason.startswith("captcha_unsupported"):
+                            cached = _negative_cache_captcha_host(
+                                job.get("application_url") or job["url"],
+                                reason,
+                            )
+                            if cached:
+                                add_event(
+                                    f"[W{worker_id}] Negative-cached {cached} "
+                                    f"same-host jobs ({reason})"
+                                )
+                    failed += 1
+                    update_state(worker_id, jobs_failed=failed,
+                                 jobs_done=applied + failed)
+                    recycle_chrome = _should_recycle_chrome(result, worker_id=worker_id)
+
+            except KeyboardInterrupt:
                 release_lock(job["url"])
-                add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
+                if _stop_event.is_set():
+                    break
+                add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
                 continue
-            elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
-                applied += 1
-                update_state(worker_id, jobs_applied=applied,
-                             jobs_done=applied + failed)
-            else:
-                reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
+            except Exception as e:
+                logger.exception("Worker %d launcher error", worker_id)
+                add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
+                release_lock(job["url"])
                 failed += 1
-                update_state(worker_id, jobs_failed=failed,
-                             jobs_done=applied + failed)
+                update_state(worker_id, jobs_failed=failed)
+                recycle_chrome = worker_id < 50 or worker_id > 89
+            finally:
+                if recycle_chrome and chrome_proc:
+                    cleanup_browser_tabs(port, keep_pages=1, park=is_campaign)
+                    cleanup_worker(worker_id, chrome_proc)
+                    chrome_proc = None
+                elif chrome_proc:
+                    cleanup_browser_tabs(port, keep_pages=1, park=is_campaign)
 
-        except KeyboardInterrupt:
-            release_lock(job["url"])
-            if _stop_event.is_set():
+            jobs_done += 1
+            if target_url and url_queue is None:
                 break
-            add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
-            continue
-        except Exception as e:
-            logger.exception("Worker %d launcher error", worker_id)
-            add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
-            failed += 1
-            update_state(worker_id, jobs_failed=failed)
-        finally:
-            if chrome_proc:
-                cleanup_browser_tabs(port)
-                cleanup_worker(worker_id, chrome_proc)
-
-        jobs_done += 1
-        if target_url:
-            break
+            if not continuous and jobs_done >= limit:
+                break
+            gap = float(config.DEFAULTS.get("job_gap_seconds") or 0)
+            if gap and _stop_event.wait(timeout=gap):
+                break
+    finally:
+        if chrome_proc:
+            cleanup_browser_tabs(port)
+            cleanup_worker(worker_id, chrome_proc)
 
     update_state(worker_id, status="done", last_action="finished")
     return applied, failed
@@ -956,14 +1710,18 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
     """
-    global POLL_INTERVAL, _worker_count
+    global POLL_INTERVAL, _worker_count, _idle_retry_done
     POLL_INTERVAL = poll_interval
     _worker_count = max(1, workers)
+    _idle_retry_done = False
     _stop_event.clear()
 
     config.ensure_dirs()
     init_db()
     console = Console()
+    closed = close_ineligible_jobs()
+    if closed:
+        logger.info("Closed %d leftover ineligible jobs", closed)
     assigned = assign_worker_batches(_worker_count)
     if assigned:
         logger.info("Assigned %d unassigned jobs across %d fixed worker batches",

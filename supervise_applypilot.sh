@@ -52,6 +52,7 @@ shutdown() {
     done
     kill -KILL "$child_pid" 2>/dev/null || true
   fi
+  pkill -KILL -f "$PYTHON -m applypilot apply --continuous" 2>/dev/null || true
   reset_orphans
   rm -f "$PIDFILE" "$LOCK/pid"
   rmdir "$LOCK" 2>/dev/null || true
@@ -60,10 +61,34 @@ shutdown() {
 trap shutdown EXIT TERM INT
 
 while true; do
-  "$PYTHON" -m applypilot apply --continuous --workers 10 --headless --model gpt-5.6-luna >> "$LOG" 2>&1 &
+  work=$("$PYTHON" - <<'PY'
+from applypilot.apply.launcher import fleet_has_apply_work, reset_retryable_failures
+if fleet_has_apply_work():
+    print("work")
+else:
+    requeued = reset_retryable_failures()
+    print("work" if requeued or fleet_has_apply_work() else "idle")
+PY
+)
+  if [[ "$work" != "work" ]]; then
+    print -r -- "$(date -Iseconds) queue drained; workers idle" >> "$LOG"
+    while true; do
+      sleep 60
+      still=$("$PYTHON" - <<'PY'
+from applypilot.apply.launcher import fleet_has_apply_work
+print("work" if fleet_has_apply_work() else "idle")
+PY
+)
+      [[ "$still" == "work" ]] && break
+    done
+    continue
+  fi
+  unset CAPSOLVER_EXTENSION
+  "$PYTHON" -m applypilot apply --continuous --workers 4 --headless --model gpt-5.6-luna >> "$LOG" 2>&1 &
   child_pid=$!
   wait "$child_pid" || true
   child_pid=""
+  pkill -KILL -f "$PYTHON -m applypilot apply --continuous" 2>/dev/null || true
   reset_orphans
   sleep 2
 done

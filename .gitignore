@@ -2,6 +2,8 @@
 profile.json
 resume.txt
 resume.pdf
+transcript.pdf
+applications.csv
 *.env
 .env.*
 !.env.example

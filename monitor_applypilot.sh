@@ -5,15 +5,37 @@ ROOT="/Users/Claw/Documents/ChatGPT/jobs/ApplyPilot"
 SUPERVISOR="/Users/Claw/.applypilot/bin/supervise_applypilot.sh"
 PYTHON="$ROOT/.venv/bin/python"
 PIDFILE="/tmp/applypilot-live.pid"
+MONITOR_LOCK="/tmp/applypilot-monitor.lock"
 LOG="/tmp/applypilot-health.log"
-WORKER_PATTERN="$ROOT/.venv/bin/python -m applypilot apply --continuous"
+WORKER_PATTERN="^$ROOT/.venv/bin/python -m applypilot apply --continuous"
 LAUNCHD_LABEL="com.applypilot.supervisor"
 HERMES="/Users/Claw/.local/bin/hermes"
 HERMES_LOCK="/tmp/applypilot-hermes-qc.lock"
 HERMES_LOG="/tmp/applypilot-hermes-qc.log"
-STALE_SECONDS=900
+EXPECTED_WORKERS=4
+STALE_SECONDS=1800
+CHECK_SECONDS=15
+ROGUE_SESSION_PATTERN="/Users/Claw/.applypilot/sessions/run_session.py"
+ROGUE_TMUX_PREFIX="run-"
 
 cd "$ROOT"
+
+if ! mkdir "$MONITOR_LOCK" 2>/dev/null; then
+  lock_pid=$(cat "$MONITOR_LOCK/pid" 2>/dev/null || true)
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$MONITOR_LOCK/pid"
+  rmdir "$MONITOR_LOCK" 2>/dev/null || exit 0
+  mkdir "$MONITOR_LOCK" || exit 0
+fi
+print -r -- "$$" > "$MONITOR_LOCK/pid"
+cleanup_monitor() {
+  rm -f "$MONITOR_LOCK/pid"
+  rmdir "$MONITOR_LOCK" 2>/dev/null || true
+}
+trap cleanup_monitor EXIT
+trap 'exit 0' TERM INT
 
 reset_orphans() {
   "$PYTHON" - <<'PY'
@@ -35,21 +57,28 @@ conn.close()
 PY
 }
 
+kill_apply_fleet() {
+  pkill -TERM -f "$WORKER_PATTERN" 2>/dev/null || true
+  for _ in {1..8}; do
+    pgrep -f "$WORKER_PATTERN" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  pkill -KILL -f "$WORKER_PATTERN" 2>/dev/null || true
+  pkill -TERM -f "Google Chrome for Testing --remote-debugging-port=93" 2>/dev/null || true
+  pkill -TERM -f "^codex exec" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "Google Chrome for Testing --remote-debugging-port=93" 2>/dev/null || true
+  pkill -KILL -f "^codex exec" 2>/dev/null || true
+}
+
+kill_rogue_session_fleet() {
+  # Campaign run_session.py is intentional. Never pkill it.
+  print -r -- "$(date -Iseconds) campaign session fleet left running (kill is a no-op)" >> "$LOG"
+  return 0
+}
+
 start_supervisor() {
-  # Never allow a dead supervisor and orphan worker to become a second queue.
-  worker_pids=(${(f)"$(pgrep -f "$WORKER_PATTERN" | awk -v self="$$" '$1 != self' || true)"})
-  if (( ${#worker_pids[@]} )); then
-    kill -TERM "${worker_pids[@]}" 2>/dev/null || true
-    for _ in {1..10}; do
-      remaining=()
-      for worker_pid in "${worker_pids[@]}"; do
-        kill -0 "$worker_pid" 2>/dev/null && remaining+=("$worker_pid")
-      done
-      (( ${#remaining[@]} == 0 )) && break
-      sleep 1
-    done
-    (( ${#remaining[@]} == 0 )) || kill -KILL "${remaining[@]}" 2>/dev/null || true
-  fi
+  kill_apply_fleet
   reset_orphans
   if launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
     if launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
@@ -84,61 +113,163 @@ run_hermes_qc() {
 }
 
 fleet_health() {
-  "$PYTHON" - <<PY
+  export EXPECTED_WORKERS STALE_SECONDS WORKER_PATTERN
+  "$PYTHON" - <<'PY'
+import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone, timedelta
 from applypilot import config
 
+expected = int(os.environ.get("EXPECTED_WORKERS", "5"))
+stale_after = timedelta(seconds=int(os.environ.get("STALE_SECONDS", "1800")))
+pattern = os.environ["WORKER_PATTERN"]
+
+def matching_processes(prefix: str) -> list[str]:
+    """Return PIDs whose executable command starts with the worker prefix.
+
+    pgrep -f also matches the monitor's inspection command, which caused
+    false duplicate/missing-worker restarts and multi-PID ps arguments.
+    """
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True,
+    )
+    matches = []
+    for line in result.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and command.startswith(prefix):
+            matches.append(pid)
+    return matches
+
+def parse_iso(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def parse_etime(value: str) -> int:
+    # ps can emit more than one formatted row during a restart race.
+    value = next((line.strip() for line in value.splitlines() if line.strip()), "")
+    if not value:
+        return 0
+    days = 0
+    if '-' in value:
+        day_text, value = value.split('-', 1)
+        days = int(day_text)
+    fields = [int(part) for part in value.split(':')]
+    if len(fields) == 3:
+        hours, minutes, seconds = fields
+    elif len(fields) == 2:
+        hours, minutes, seconds = 0, *fields
+    else:
+        hours, minutes, seconds = 0, 0, fields[0]
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+apply_procs = matching_processes(pattern.removeprefix("^"))
+chrome_ports = set()
+for line in subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout.splitlines():
+    marker = "--remote-debugging-port="
+    if "Google Chrome for Testing" in line and marker in line:
+        port = line.split(marker, 1)[1].split()[0]
+        chrome_ports.add(port)
+luna = 0
+for line in subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout.splitlines():
+    if line.startswith("codex exec") and "--model gpt-5.6-luna" in line:
+        luna += 1
+
 conn = sqlite3.connect(config.DB_PATH)
-cutoff = (datetime.now(timezone.utc) - timedelta(seconds=$STALE_SECONDS)).isoformat()
-stale = conn.execute(
-    "SELECT COUNT(*) FROM jobs WHERE apply_status='in_progress' AND last_attempted_at < ?",
-    (cutoff,),
+now = datetime.now(timezone.utc)
+in_progress = conn.execute(
+    "SELECT apply_worker, last_attempted_at FROM jobs WHERE apply_status = 'in_progress'"
+).fetchall()
+claimable = conn.execute(
+    """
+    SELECT COUNT(*) FROM jobs
+     WHERE (apply_status IS NULL OR apply_status = 'failed')
+       AND (apply_attempts IS NULL OR apply_attempts < ?)
+    """
+, (config.DEFAULTS["max_apply_attempts"],)
 ).fetchone()[0]
-missing = []
-for worker in range(10):
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_worker=? AND apply_status IS NULL",
-        (worker,),
-    ).fetchone()[0]
-    active = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_worker=? AND apply_status='in_progress'",
-        (worker,),
-    ).fetchone()[0]
-    if pending and not active:
-        missing.append(str(worker))
+stale = 0
+for _worker, attempted in in_progress:
+    started = parse_iso(attempted)
+    if started is not None and now - started > stale_after:
+        stale += 1
 conn.close()
-print(stale, ",".join(missing) or "-")
+
+active = max(len(in_progress), len(chrome_ports), luna)
+# Luna dips for a few seconds between jobs; DB may have only one active claim
+# even while all browser slots are healthy. One live Chrome is enough while
+# leftover work is serialized one company at a time. Restart only if every
+# fleet browser is gone.
+missing = len(chrome_ports) == 0
+if claimable == 0 and len(in_progress) == 0:
+    print(
+        f"ok:drained procs={len(apply_procs)} active={active} "
+        f"db={len(in_progress)} chrome={len(chrome_ports)} luna={luna} stale=0"
+    )
+elif len(apply_procs) != 1:
+    print(
+        f"restart:duplicates procs={len(apply_procs)} active={active} "
+        f"db={len(in_progress)} chrome={len(chrome_ports)} luna={luna} stale={stale}"
+    )
+elif stale:
+    print(
+        f"restart:stale procs=1 active={active} db={len(in_progress)} "
+        f"chrome={len(chrome_ports)} luna={luna} stale={stale}"
+    )
+elif claimable > 0 and len(apply_procs) == 1 and missing:
+    etime_output = subprocess.run(
+        ["ps", "-p", apply_procs[0], "-o", "etime="],
+        capture_output=True, text=True,
+    ).stdout
+    seconds = parse_etime(etime_output)
+    if seconds >= 45:
+        print(
+            f"restart:missing procs=1 active={active} db={len(in_progress)} "
+            f"chrome={len(chrome_ports)} luna={luna} stale=0"
+        )
+    else:
+        print(
+            f"ok:warming procs=1 active={active} db={len(in_progress)} "
+            f"chrome={len(chrome_ports)} luna={luna} stale=0"
+        )
+else:
+    print(
+        f"ok:healthy procs=1 active={active} db={len(in_progress)} "
+        f"chrome={len(chrome_ports)} luna={luna} stale=0"
+    )
 PY
 }
 
 missing_checks=0
 last_qc=0
 while true; do
+  # Campaign run_session.py is allowed.
+
   pid=""
   [[ -f "$PIDFILE" ]] && pid=$(cat "$PIDFILE" 2>/dev/null || true)
 
   if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     start_supervisor
+    missing_checks=0
     print -r -- "$(date -Iseconds) restarted supervisor" >> "$LOG"
   else
     health=$(fleet_health)
-    stale_count=${health%% *}
-    missing_workers=${health#* }
-    if (( stale_count > 0 )); then
-      print -r -- "$(date -Iseconds) stale workers=$stale_count; restarting" >> "$LOG"
+    print -r -- "$(date -Iseconds) $health supervisor=$pid workers=$EXPECTED_WORKERS" >> "$LOG"
+    if [[ "$health" == restart:duplicates* || "$health" == restart:stale* ]]; then
       start_supervisor
       missing_checks=0
-    elif [[ "$missing_workers" != "-" ]]; then
+    elif [[ "$health" == restart:missing* ]]; then
       (( missing_checks += 1 ))
-      print -r -- "$(date -Iseconds) missing workers=$missing_workers check=$missing_checks" >> "$LOG"
-      if (( missing_checks >= 3 )); then
+      if (( missing_checks >= 2 )); then
         start_supervisor
         missing_checks=0
       fi
     else
       missing_checks=0
-      print -r -- "$(date -Iseconds) healthy supervisor=$pid workers=10" >> "$LOG"
     fi
   fi
 
@@ -147,5 +278,5 @@ while true; do
     run_hermes_qc
     last_qc=$now
   fi
-  sleep 60
+  sleep "$CHECK_SECONDS"
 done

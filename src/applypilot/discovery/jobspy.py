@@ -8,6 +8,8 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import math
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -115,9 +117,45 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     return False
 
 
+# -- Base pay / salary disclosure -------------------------------------------
+
+_PAY_RE = re.compile(
+    r"\$\s*\d"
+    r"|\b(?:usd|salary|compensation|base pay|hourly|annually)\b.{0,40}\d"
+    r"|\b\d{2,3}(?:,\d{3})?\s*(?:-|to)\s*\$?\d"
+    r"|\b\d{2,3}\s*(?:per hour|/hr|/hour|an hour|a year|/yr|k\b)",
+    re.I,
+)
+
+
+def _blank(val) -> bool:
+    if val is None:
+        return True
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return True
+    except Exception:
+        pass
+    text = str(val).strip()
+    return text == "" or text.lower() in {"nan", "none", "n/a", "null"}
+
+
+def job_has_listed_pay(salary=None, description: str | None = None) -> bool:
+    """True when the job discloses a salary / base pay (field or listing text)."""
+    if not _blank(salary):
+        return True
+    blob = str(description or "")
+    return bool(_PAY_RE.search(blob[:8000]))
+
+
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
+def store_jobspy_results(
+    conn: sqlite3.Connection,
+    df,
+    source_label: str,
+    require_base_pay: bool = False,
+) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
     new = 0
@@ -166,6 +204,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
 
+        if require_base_pay and not job_has_listed_pay(salary, description):
+            continue
+
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
@@ -195,6 +236,7 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    require_base_pay: bool = False,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -277,7 +319,9 @@ def _run_one_search(
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(
+        conn, df, s["query"], require_base_pay=require_base_pay,
+    )
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
@@ -377,6 +421,7 @@ def _full_crawl(
     defaults = search_cfg.get("defaults", {})
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    require_base_pay = bool(search_cfg.get("require_base_pay"))
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -412,6 +457,7 @@ def _full_crawl(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
+            require_base_pay=require_base_pay,
         )
         completed += 1
         total_new += result["new"]
