@@ -26,7 +26,7 @@ The database, resume, and profile never leave the student's machine unless they 
 | Their own `profile.json` | Name, email, phone, school, work authorization |
 | Optional transcript | `~/.applypilot/transcript.pdf` |
 
-API keys, if they use them, go in `~/.applypilot/.env`. Copy from `.env.example`. Never paste a key into chat, a slide, or git.
+No Gemini key is required. `applypilot doctor` may still list an LLM key; that check is optional. Submitting applications uses the Codex CLI, which the student signs into once. A Gemini key is only for the older score and cover-letter commands, which this class does not run.
 
 ## Lesson 1 — Install and look around
 

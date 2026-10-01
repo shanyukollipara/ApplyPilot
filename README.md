@@ -6,6 +6,8 @@
 
 Teaching a class with this fork? Start with [docs/CLASSROOM.md](docs/CLASSROOM.md).
 
+This fork submits applications with the Codex CLI. A Gemini API key is not required for `sync-simplify` or `apply`. Gemini is only used by the older score and cover-letter commands.
+
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
@@ -47,12 +49,12 @@ applypilot apply --dry-run  # fill forms without submitting
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
+**Requires:** Python 3.11+, Node.js (for npx), Codex CLI, Chrome. No Gemini key.
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
 ### Discovery + Tailoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
+**Requires:** Python 3.11+. A Gemini key is only needed if you still run the old score and cover-letter commands.
 
 Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
 
@@ -92,11 +94,11 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| Gemini API key | Old score and cover-letter commands only | Not used by `apply` |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+`apply` does not call Gemini. The older score and cover-letter commands can use a free Gemini key from [aistudio.google.com](https://aistudio.google.com), an OpenAI key, or a local model.
 
 ### Optional
 

@@ -358,8 +358,8 @@ def doctor() -> None:
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM API key", warn_mark,
+                        "Not required. Apply uses the signed-in Codex CLI"))
 
     # --- Tier 3 checks ---
     # Codex CLI
